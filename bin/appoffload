@@ -1,0 +1,148 @@
+#!/bin/bash
+
+set -u
+umask 077
+
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+    LINK_DIR=$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
+    SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+    case "$SCRIPT_PATH" in /*) ;; *) SCRIPT_PATH="$LINK_DIR/$SCRIPT_PATH" ;; esac
+done
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
+PROJECT_DIR=$(cd "$SCRIPT_DIR/.." && pwd -P)
+# shellcheck source=../lib/core.sh
+. "$PROJECT_DIR/lib/core.sh"
+
+usage() {
+    cat <<'EOF'
+AppSupport Offload — safely move ~/Library/Application Support folders
+
+Usage:
+  appoffload                         Open the interactive TUI
+  appoffload list                    List local and offloaded folders
+  appoffload audit                   Compare installed apps and support folders
+  appoffload locations               List installed-app search locations
+  appoffload locations add PATH      Persist an additional search location
+  appoffload locations remove PATH   Remove a custom search location
+  appoffload offload NAME --target /Volumes/DISK
+  appoffload offloads                List managed offloads
+  appoffload offloads restore NAME
+  appoffload offloads move NAME --target /Volumes/DISK
+  appoffload offloads delete NAME --yes
+  appoffload restore NAME
+  appoffload help
+
+Offloads are copied with macOS metadata, SHA-256 verified, and activated with
+a symbolic link only after verification. Running apps with open files in the
+selected folder block the operation. Restore performs the reverse transaction.
+EOF
+}
+
+resolve_source() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$APP_SUPPORT_ROOT" "$1" ;;
+    esac
+}
+
+print_cli_summary() {
+    local verb="$1" name="$2" delta="$3"
+    printf '\n%s complete: %s\n' "$verb" "$name"
+    if [ "$delta" -ge 0 ]; then
+        printf 'Local space saved: %s\n' "$(human_bytes "$delta")"
+    else
+        printf 'Additional local space consumed: %s\n' "$(human_bytes "$((0 - delta))")"
+    fi
+}
+
+print_external_summary() {
+    local verb="$1" name="$2" bytes="$3"
+    printf '\n%s complete: %s\n' "$verb" "$name"
+    printf 'External data affected: %s\nLocal disk usage unchanged.\n' "$(human_bytes "$bytes")"
+}
+
+command_name="${1:-tui}"
+case "$command_name" in
+    tui)
+        if [ ! -t 0 ] || [ ! -t 1 ]; then echo "The TUI requires an interactive terminal." >&2; exit 2; fi
+        # shellcheck source=../lib/tui.sh
+        . "$PROJECT_DIR/lib/tui.sh"
+        run_tui
+        ;;
+    list)
+        printf '%-48s %12s  %s\n' "FOLDER" "SIZE" "LOCATION"
+        while IFS=$'\t' read -r size status path; do
+            printf '%-48s %12s  %s\n' "$(basename "$path")" "$(human_bytes "$size")" "$status"
+        done < <(list_folders | sort -t $'\t' -k1,1nr)
+        ;;
+    audit)
+        printf '%-40s %12s  %-11s %s\n' "FOLDER" "SIZE" "ASSESSMENT" "MATCH / REASON"
+        while IFS=$'\t' read -r size classification evidence path; do
+            printf '%-40s %12s  %-11s %s\n' "$(basename "$path")" "$(human_bytes "$size")" "$(printf '%s' "$classification" | tr '[:lower:]' '[:upper:]')" "$evidence"
+        done < <(audit_folders | sort -t $'\t' -k1,1nr)
+        ;;
+    locations)
+        locations_action="${2:-list}"
+        case "$locations_action" in
+            list)
+                [ "$#" -le 2 ] || { usage >&2; exit 2; }
+                printf '%-10s %-13s %s\n' "TYPE" "STATUS" "FOLDER"
+                while IFS=$'\t' read -r kind status path; do
+                    printf '%-10s %-13s %s\n' "$kind" "$status" "$path"
+                done < <(list_app_roots)
+                ;;
+            add)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                if add_app_root "$3" >/dev/null; then echo "Added app search location: $LAST_APP_ROOT"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            remove)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                if remove_app_root "$3"; then echo "Removed app search location: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        ;;
+    offloads)
+        offloads_action="${2:-list}"
+        case "$offloads_action" in
+            list)
+                [ "$#" -le 2 ] || { usage >&2; exit 2; }
+                printf '%-48s %12s  %s\n' "FOLDER" "SIZE" "TARGET"
+                while IFS=$'\t' read -r size status path; do
+                    [ "$status" = "offloaded" ] || continue
+                    destination=$(managed_link_destination "$path" 2>/dev/null || echo "unavailable")
+                    printf '%-48s %12s  %s\n' "$(basename "$path")" "$(human_bytes "$size")" "$destination"
+                done < <(list_folders | sort -t $'\t' -k1,1nr)
+                ;;
+            restore)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                source=$(resolve_source "$3")
+                if restore_folder "$source"; then print_cli_summary "Restore" "$(basename "$source")" "$LAST_LOCAL_DELTA_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            move)
+                [ "$#" -eq 5 ] && [ "$4" = "--target" ] || { usage >&2; exit 2; }
+                source=$(resolve_source "$3")
+                if move_offload "$source" "$5"; then print_external_summary "Offload move" "$(basename "$source")" "$LAST_EXTERNAL_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            delete)
+                [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { echo "Permanent deletion requires: appoffload offloads delete NAME --yes" >&2; exit 2; }
+                source=$(resolve_source "$3")
+                if delete_offload "$source"; then print_external_summary "Permanent deletion" "$(basename "$source")" "$LAST_EXTERNAL_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        ;;
+    offload)
+        [ "$#" -ge 4 ] && [ "$3" = "--target" ] || { usage >&2; exit 2; }
+        source=$(resolve_source "$2")
+        if offload_folder "$source" "$4"; then print_cli_summary "Offload" "$(basename "$source")" "$LAST_LOCAL_DELTA_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+        ;;
+    restore)
+        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+        source=$(resolve_source "$2")
+        if restore_folder "$source"; then print_cli_summary "Restore" "$(basename "$source")" "$LAST_LOCAL_DELTA_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+        ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

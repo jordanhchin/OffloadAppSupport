@@ -1,0 +1,813 @@
+#!/bin/bash
+
+# Core transaction engine for appoffload. Compatible with macOS Bash 3.2.
+
+APP_SUPPORT_ROOT="${APPOFFLOAD_APP_SUPPORT_ROOT:-$HOME/Library/Application Support}"
+VOLUMES_ROOT="${APPOFFLOAD_VOLUMES_ROOT:-/Volumes}"
+APPLICATION_ROOTS_OVERRIDE="${APPOFFLOAD_APPLICATION_ROOTS:-}"
+CONFIG_DIR="${APPOFFLOAD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/appoffload}"
+APP_ROOTS_FILE="$CONFIG_DIR/app-roots"
+PREFERENCES_ROOT="${APPOFFLOAD_PREFERENCES_ROOT:-$HOME/Library/Preferences}"
+SAVED_STATE_ROOT="${APPOFFLOAD_SAVED_STATE_ROOT:-$HOME/Library/Saved Application State}"
+MANAGED_DIR_NAME=".AppSupportOffload"
+APPOFFLOAD_ERROR=""
+LAST_LOCAL_DELTA_BYTES=0
+LAST_EXTERNAL_BYTES=0
+LAST_APP_ROOT=""
+ACTIVE_PHASE=""
+ACTIVE_SOURCE=""
+ACTIVE_BACKUP=""
+ACTIVE_STAGE=""
+ACTIVE_FINAL=""
+ACTIVE_WORKDIR=""
+ACTIVE_COPY_PID=""
+ACTIVE_LINK_ROLLBACK=""
+LOCK_DIR=""
+
+emit_progress() {
+    local phase="$1" percent="$2" detail="${3:-}"
+    if type ui_progress >/dev/null 2>&1; then
+        ui_progress "$phase" "$percent" "$detail"
+    elif [ -t 1 ]; then
+        printf '\r%-24s [%3s%%] %-36s' "$phase" "$percent" "$detail"
+        [ "$percent" = "100" ] && printf '\n'
+    fi
+}
+
+human_bytes() {
+    awk -v bytes="$1" 'BEGIN {
+        split("B KB MB GB TB PB", unit, " "); i=1
+        while (bytes >= 1000 && i < 6) { bytes /= 1000; i++ }
+        if (i == 1) printf "%d %s", bytes, unit[i]
+        else printf "%.1f %s", bytes, unit[i]
+    }'
+}
+
+path_bytes() {
+    local path="$1" blocks
+    blocks=$(/usr/bin/du -sk "$path" 2>/dev/null | /usr/bin/awk '{print $1}') || return 1
+    echo $((blocks * 1024))
+}
+
+available_bytes() {
+    /bin/df -Pk "$1" 2>/dev/null | /usr/bin/awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+encode_field() {
+    printf '%s' "$1" | /usr/bin/base64 | /usr/bin/tr -d '\n'
+}
+
+is_managed_destination() {
+    case "$1" in
+        "$VOLUMES_ROOT"/*/"$MANAGED_DIR_NAME"/*/Application\ Support/*) return 0 ;;
+        *)
+            [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" = "1" ] && case "$1" in
+                */"$MANAGED_DIR_NAME"/*/Application\ Support/*) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+}
+
+managed_link_destination() {
+    local source="$1" raw destination
+    [ -L "$source" ] || return 1
+    raw=$(/usr/bin/readlink "$source") || return 1
+    case "$raw" in
+        /*) destination="$raw" ;;
+        *) destination="$(cd "$(/usr/bin/dirname "$source")" && pwd -P)/$raw" ;;
+    esac
+    if [ -d "$destination" ]; then
+        destination=$(cd "$destination" && pwd -P) || return 1
+    fi
+    is_managed_destination "$destination" || return 1
+    printf '%s\n' "$destination"
+}
+
+is_application_support_child() {
+    local path="$1" parent root
+    parent=$(cd "$(/usr/bin/dirname "$path")" 2>/dev/null && pwd -P) || return 1
+    root=$(cd "$APP_SUPPORT_ROOT" 2>/dev/null && pwd -P) || return 1
+    [ "$parent" = "$root" ]
+}
+
+list_external_volumes() {
+    local volume
+    [ -d "$VOLUMES_ROOT" ] || return 0
+    for volume in "$VOLUMES_ROOT"/*; do
+        [ -d "$volume" ] || continue
+        [ -w "$volume" ] || continue
+        printf '%s\t%s\n' "$(available_bytes "$volume")" "$volume"
+    done
+}
+
+list_folders() {
+    local item size status destination
+    [ -d "$APP_SUPPORT_ROOT" ] || return 0
+    for item in "$APP_SUPPORT_ROOT"/*; do
+        [ -e "$item" ] || [ -L "$item" ] || continue
+        if destination=$(managed_link_destination "$item" 2>/dev/null); then
+            size=$(path_bytes "$destination" 2>/dev/null || echo 0)
+            status="offloaded"
+        elif [ -d "$item" ] && [ ! -L "$item" ]; then
+            size=$(path_bytes "$item" 2>/dev/null || echo 0)
+            status="local"
+        else
+            continue
+        fi
+        printf '%s\t%s\t%s\n' "$size" "$status" "$item"
+    done
+}
+
+normalize_identity() {
+    printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]' | /usr/bin/tr -cd '[:alnum:]'
+}
+
+plist_value() {
+    local plist="$1" key="$2"
+    /usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null | /usr/bin/head -n 1
+}
+
+default_app_roots() {
+    printf '%s\n' "/Applications" "$HOME/Applications" "/System/Applications"
+}
+
+custom_app_roots() {
+    [ -f "$APP_ROOTS_FILE" ] || return 0
+    while IFS= read -r root || [ -n "$root" ]; do
+        [ -n "$root" ] || continue
+        case "$root" in \#*) continue ;; esac
+        printf '%s\n' "$root"
+    done < "$APP_ROOTS_FILE"
+}
+
+configured_app_roots() {
+    local roots root
+    {
+        if [ -n "$APPLICATION_ROOTS_OVERRIDE" ]; then
+            roots="$APPLICATION_ROOTS_OVERRIDE"
+            while [ -n "$roots" ]; do
+                case "$roots" in
+                    *:*) root=${roots%%:*}; roots=${roots#*:} ;;
+                    *) root=$roots; roots="" ;;
+                esac
+                [ -n "$root" ] && printf '%s\n' "$root"
+            done
+        else
+            default_app_roots
+        fi
+        custom_app_roots
+    } | /usr/bin/awk 'NF && !seen[$0]++'
+}
+
+list_app_roots() {
+    local root status
+    default_app_roots | while IFS= read -r root; do
+        [ -d "$root" ] && status="available" || status="unavailable"
+        printf 'default\t%s\t%s\n' "$status" "$root"
+    done
+    custom_app_roots | while IFS= read -r root; do
+        [ -d "$root" ] && status="available" || status="unavailable"
+        printf 'custom\t%s\t%s\n' "$status" "$root"
+    done
+}
+
+add_app_root() {
+    local requested="$1" root temp existing
+    APPOFFLOAD_ERROR=""
+    LAST_APP_ROOT=""
+    case "$requested" in
+        "~") requested="$HOME" ;;
+        "~/"*) requested="$HOME/${requested:2}" ;;
+    esac
+    case "$requested" in
+        /*) ;;
+        *) APPOFFLOAD_ERROR="App search location must be an absolute path."; return 1 ;;
+    esac
+    case "$requested" in *$'\n'*|*$'\r'*|*$'\t'*) APPOFFLOAD_ERROR="App search location contains an invalid control character."; return 1 ;; esac
+    [ -d "$requested" ] || { APPOFFLOAD_ERROR="Folder does not exist: $requested"; return 1; }
+    root=$(cd "$requested" 2>/dev/null && pwd -P) || { APPOFFLOAD_ERROR="Folder cannot be read: $requested"; return 1; }
+    existing=$(configured_app_roots | /usr/bin/awk -v root="$root" '$0 == root {print; exit}')
+    [ -z "$existing" ] || { APPOFFLOAD_ERROR="Location is already configured: $root"; return 1; }
+    /bin/mkdir -p "$CONFIG_DIR" || { APPOFFLOAD_ERROR="Could not create configuration folder: $CONFIG_DIR"; return 1; }
+    temp=$(/usr/bin/mktemp "$CONFIG_DIR/.app-roots.XXXXXX") || { APPOFFLOAD_ERROR="Could not create a configuration update."; return 1; }
+    custom_app_roots > "$temp"
+    printf '%s\n' "$root" >> "$temp"
+    LC_ALL=C /usr/bin/sort -u "$temp" -o "$temp"
+    /bin/chmod 600 "$temp"
+    /bin/mv "$temp" "$APP_ROOTS_FILE" || { /bin/rm -f "$temp"; APPOFFLOAD_ERROR="Could not save the app search location."; return 1; }
+    LAST_APP_ROOT="$root"
+    printf '%s\n' "$root"
+}
+
+remove_app_root() {
+    local requested="$1" root temp found=0 item
+    APPOFFLOAD_ERROR=""
+    root="$requested"
+    [ -d "$requested" ] && root=$(cd "$requested" 2>/dev/null && pwd -P)
+    [ -f "$APP_ROOTS_FILE" ] || { APPOFFLOAD_ERROR="No custom app search locations are configured."; return 1; }
+    temp=$(/usr/bin/mktemp "$CONFIG_DIR/.app-roots.XXXXXX") || { APPOFFLOAD_ERROR="Could not create a configuration update."; return 1; }
+    : > "$temp"
+    while IFS= read -r item || [ -n "$item" ]; do
+        [ -n "$item" ] || continue
+        if [ "$item" = "$root" ]; then found=1; else printf '%s\n' "$item" >> "$temp"; fi
+    done < "$APP_ROOTS_FILE"
+    if [ "$found" -ne 1 ]; then
+        /bin/rm -f "$temp"
+        APPOFFLOAD_ERROR="Custom location is not configured: $root"
+        return 1
+    fi
+    /bin/chmod 600 "$temp"
+    /bin/mv "$temp" "$APP_ROOTS_FILE" || { /bin/rm -f "$temp"; APPOFFLOAD_ERROR="Could not save the location removal."; return 1; }
+}
+
+build_installed_app_index() {
+    local output="$1" root app plist identifier display bundle_name executable key
+    : > "$output" || return 1
+    while IFS= read -r root; do
+        [ -d "$root" ] || continue
+        while IFS= read -r -d '' app; do
+            plist="$app/Contents/Info.plist"
+            [ -f "$plist" ] || continue
+            identifier=$(plist_value "$plist" CFBundleIdentifier)
+            display=$(plist_value "$plist" CFBundleDisplayName)
+            bundle_name=$(plist_value "$plist" CFBundleName)
+            executable=$(plist_value "$plist" CFBundleExecutable)
+            [ -n "$display" ] || display=$bundle_name
+            [ -n "$display" ] || display=$(/usr/bin/basename "$app" .app)
+            display=$(printf '%s' "$display" | /usr/bin/tr '\t\r\n' '   ')
+            app=$(printf '%s' "$app" | /usr/bin/tr '\t\r\n' '   ')
+            if [ -n "$identifier" ]; then
+                key=$(printf '%s' "$identifier" | /usr/bin/tr '[:upper:]' '[:lower:]')
+                printf '%s\tid\t%s\t%s\n' "$key" "$display" "$app" >> "$output"
+            fi
+            for key in "$display" "$bundle_name" "$executable"; do
+                [ -n "$key" ] || continue
+                key=$(normalize_identity "$key")
+                [ -n "$key" ] && printf '%s\tname\t%s\t%s\n' "$key" "$display" "$app" >> "$output"
+            done
+        done < <(/usr/bin/find "$root" -type d -name '*.app' -prune -print0 2>/dev/null)
+    done < <(configured_app_roots)
+    LC_ALL=C /usr/bin/sort -u "$output" -o "$output"
+}
+
+folder_has_uninstall_evidence() {
+    local name="$1"
+    [ -e "$PREFERENCES_ROOT/$name.plist" ] || [ -e "$SAVED_STATE_ROOT/$name.savedState" ]
+}
+
+# Output fields: allocated bytes, classification, matched app/evidence, folder path.
+# "recommend" is intentionally conservative: it requires a reverse-domain-style
+# folder name, no installed bundle-ID match, and a surviving preference/state file.
+audit_folders() {
+    local workdir index size location path name id_key name_key match related classification evidence
+    workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-audit.XXXXXX") || return 1
+    index="$workdir/apps.tsv"
+    build_installed_app_index "$index" || { /bin/rm -rf "$workdir"; return 1; }
+    while IFS=$'\t' read -r size location path; do
+        [ -n "$path" ] || continue
+        name=$(/usr/bin/basename "$path")
+        if [ "$location" = "offloaded" ]; then
+            printf '%s\toffloaded\tmanaged external copy\t%s\n' "$size" "$path"
+            continue
+        fi
+        id_key=$(printf '%s' "$name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+        name_key=$(normalize_identity "$name")
+        match=$(/usr/bin/awk -F '\t' -v id="$id_key" -v name="$name_key" '
+            ($2 == "id" && $1 == id) || ($2 == "name" && $1 == name) { print $3; exit }
+        ' "$index")
+        if [ -n "$match" ]; then
+            classification="installed"
+            evidence="$match"
+        elif [[ "$id_key" == com.apple.* || "$id_key" == group.com.apple.* ]]; then
+            classification="system"
+            evidence="macOS-managed component"
+        else
+            related=$(/usr/bin/awk -F '\t' -v id="$id_key" '
+                $2 == "id" && (index(id, $1 ".") == 1 || index($1, id ".") == 1) { print $3; exit }
+            ' "$index")
+            if [ -n "$related" ]; then
+                classification="related"
+                evidence="related installed app: $related"
+            elif [ "$size" -gt 0 ] && [[ "$name" =~ ^[[:alnum:]_-]+(\.[[:alnum:]_-]+){2,}$ ]] && folder_has_uninstall_evidence "$name"; then
+                classification="recommend"
+                evidence="no matching app; leftover preference/state evidence"
+            else
+                classification="review"
+                evidence="no reliable app match"
+            fi
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$size" "$classification" "$evidence" "$path"
+    done < <(list_folders)
+    /bin/rm -rf "$workdir"
+}
+
+processes_using() {
+    local path="$1" current_pid="" current_command=""
+    local lsof_bin="${APPOFFLOAD_LSOF:-/usr/sbin/lsof}"
+    [ -x "$lsof_bin" ] || return 0
+    "$lsof_bin" -Fpc +D "$path" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            p*) current_pid=${line#p} ;;
+            c*)
+                current_command=${line#c}
+                [ "$current_pid" = "$$" ] || printf '%s\t%s\n' "$current_pid" "$current_command"
+                ;;
+        esac
+    done
+}
+
+ensure_not_in_use() {
+    local path="$1" users
+    users=$(processes_using "$path")
+    if [ -n "$users" ]; then
+        APPOFFLOAD_ERROR="Files are currently open. Quit these processes first: $(printf '%s' "$users" | /usr/bin/awk -F '\t' '{printf "%s (PID %s) ", $2, $1}')"
+        return 1
+    fi
+    return 0
+}
+
+sha256_file() {
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+create_manifest() {
+    local root="$1" output="$2" temp item relative encoded kind size digest target
+    temp="${output}.unsorted"
+    : > "$temp" || return 1
+
+    while IFS= read -r -d '' item; do
+        relative=${item#"$root"/}
+        encoded=$(encode_field "$relative") || return 1
+        if [ -L "$item" ]; then
+            kind="L"
+            target=$(/usr/bin/readlink "$item") || return 1
+            digest=$(encode_field "$target") || return 1
+            printf '%s\t%s\t0\t%s\n' "$encoded" "$kind" "$digest" >> "$temp"
+        elif [ -f "$item" ]; then
+            kind="F"
+            size=$(/usr/bin/stat -f '%z' "$item") || return 1
+            digest=$(sha256_file "$item") || return 1
+            printf '%s\t%s\t%s\t%s\n' "$encoded" "$kind" "$size" "$digest" >> "$temp"
+        elif [ -d "$item" ]; then
+            printf '%s\tD\t0\t-\n' "$encoded" >> "$temp"
+        else
+            APPOFFLOAD_ERROR="Unsupported special file: $item"
+            return 1
+        fi
+    done < <(/usr/bin/find "$root" -mindepth 1 -print0)
+
+    LC_ALL=C /usr/bin/sort "$temp" > "$output"
+    /bin/rm -f "$temp"
+}
+
+verify_trees() {
+    local source="$1" destination="$2" workdir="$3"
+    local before="$workdir/source.manifest" after="$workdir/destination.manifest" final_source="$workdir/source-final.manifest"
+    emit_progress "Checksumming source" 0 "Building SHA-256 manifest"
+    create_manifest "$source" "$before" || return 1
+    emit_progress "Checksumming source" 100 "Manifest complete"
+    emit_progress "Verifying copy" 5 "Hashing copied data"
+    create_manifest "$destination" "$after" || return 1
+    if ! /usr/bin/cmp -s "$before" "$after"; then
+        APPOFFLOAD_ERROR="SHA-256 manifests differ; the original data was left untouched."
+        return 1
+    fi
+    # Hash the source again to detect writes that raced with the copy/first hash.
+    create_manifest "$source" "$final_source" || return 1
+    if ! /usr/bin/cmp -s "$after" "$final_source"; then
+        APPOFFLOAD_ERROR="The source changed during verification; quit the app and retry."
+        return 1
+    fi
+    emit_progress "Verifying copy" 100 "Every file matches"
+}
+
+copy_with_progress() {
+    local source="$1" destination="$2" total="$3" pid copied percent status
+    local ditto_bin="${APPOFFLOAD_DITTO:-/usr/bin/ditto}"
+    "$ditto_bin" --rsrc --extattr --acl "$source" "$destination" &
+    pid=$!
+    ACTIVE_COPY_PID=$pid
+    while /bin/kill -0 "$pid" 2>/dev/null; do
+        copied=$(path_bytes "$destination" 2>/dev/null || echo 0)
+        if [ "$total" -gt 0 ]; then
+            percent=$((copied * 100 / total))
+            [ "$percent" -gt 99 ] && percent=99
+        else
+            percent=0
+        fi
+        emit_progress "Copying" "$percent" "$(human_bytes "$copied") / $(human_bytes "$total")"
+        /bin/sleep 0.25
+    done
+    wait "$pid"
+    status=$?
+    ACTIVE_COPY_PID=""
+    ACTIVE_LINK_ROLLBACK=""
+    [ "$status" -eq 0 ] || {
+        APPOFFLOAD_ERROR="ditto could not copy the folder (exit $status)."
+        return "$status"
+    }
+    emit_progress "Copying" 100 "$(human_bytes "$total") copied"
+}
+
+filesystem_personality() {
+    /usr/sbin/diskutil info "$1" 2>/dev/null | /usr/bin/awk -F ': *' '/File System Personality/ {print $2; exit}'
+}
+
+ensure_compatible_filesystem() {
+    local target="$1" personality
+    [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" = "1" ] && return 0
+    personality=$(filesystem_personality "$target")
+    case "$personality" in
+        *APFS*|*"Mac OS Extended"*) return 0 ;;
+        "") APPOFFLOAD_ERROR="Could not identify the target filesystem." ;;
+        *) APPOFFLOAD_ERROR="Unsupported target filesystem: $personality. Use APFS (recommended) or Mac OS Extended to preserve app metadata." ;;
+    esac
+    return 1
+}
+
+acquire_lock() {
+    LOCK_DIR="$APP_SUPPORT_ROOT/.appoffload.lock"
+    if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+    local old_pid=""
+    [ -f "$LOCK_DIR/pid" ] && old_pid=$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$old_pid" ] && /bin/kill -0 "$old_pid" 2>/dev/null; then
+        APPOFFLOAD_ERROR="Another appoffload operation is running (PID $old_pid)."
+        return 1
+    fi
+    /bin/rm -rf "$LOCK_DIR"
+    /bin/mkdir "$LOCK_DIR" || return 1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
+
+release_lock() {
+    [ -n "$LOCK_DIR" ] && [ "$LOCK_DIR" != "/" ] && /bin/rm -rf "$LOCK_DIR"
+    LOCK_DIR=""
+}
+
+write_journal() {
+    local file="$1" phase="$2"
+    {
+        printf 'version=1\nphase=%s\n' "$phase"
+        printf 'source=%s\n' "$(encode_field "$ACTIVE_SOURCE")"
+        printf 'backup=%s\n' "$(encode_field "$ACTIVE_BACKUP")"
+        printf 'stage=%s\n' "$(encode_field "$ACTIVE_STAGE")"
+        printf 'final=%s\n' "$(encode_field "$ACTIVE_FINAL")"
+    } > "$file"
+}
+
+clear_active_transaction() {
+    ACTIVE_PHASE=""
+    ACTIVE_SOURCE=""
+    ACTIVE_BACKUP=""
+    ACTIVE_STAGE=""
+    ACTIVE_FINAL=""
+    ACTIVE_WORKDIR=""
+    ACTIVE_COPY_PID=""
+}
+
+rollback_active_transaction() {
+    # Preserve the verified external copy. Only repair the local source path.
+    if [ -n "$ACTIVE_COPY_PID" ] && /bin/kill -0 "$ACTIVE_COPY_PID" 2>/dev/null; then
+        /bin/kill -TERM "$ACTIVE_COPY_PID" 2>/dev/null || true
+        wait "$ACTIVE_COPY_PID" 2>/dev/null || true
+        ACTIVE_COPY_PID=""
+    fi
+    if [ -n "$ACTIVE_BACKUP" ] && { [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; }; then
+        if [ -L "$ACTIVE_SOURCE" ]; then
+            /bin/unlink "$ACTIVE_SOURCE" 2>/dev/null || true
+        fi
+        if [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
+            /bin/mv "$ACTIVE_BACKUP" "$ACTIVE_SOURCE" 2>/dev/null || true
+        fi
+    fi
+    if [ -n "$ACTIVE_LINK_ROLLBACK" ] && [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
+        /bin/ln -s "$ACTIVE_LINK_ROLLBACK" "$ACTIVE_SOURCE" 2>/dev/null || true
+    fi
+    if [ -n "$ACTIVE_STAGE" ] && [ -e "$ACTIVE_STAGE" ]; then
+        case "$ACTIVE_STAGE" in
+            */.appoffload-staging-*) /bin/rm -rf "$ACTIVE_STAGE" ;;
+        esac
+    fi
+    if [ -n "$ACTIVE_WORKDIR" ] && [ -d "$ACTIVE_WORKDIR" ]; then
+        case "$ACTIVE_WORKDIR" in
+            "${TMPDIR:-/tmp}"/appoffload-*) /bin/rm -rf "$ACTIVE_WORKDIR" ;;
+        esac
+    fi
+    release_lock
+    clear_active_transaction
+}
+
+offload_folder() {
+    local source="$1" target="$2" name user_name managed_root transaction_root transaction_id
+    local final stage backup workdir journal total free required copy_verified=0
+    APPOFFLOAD_ERROR=""
+    LAST_LOCAL_DELTA_BYTES=0
+    LAST_EXTERNAL_BYTES=0
+    [ -d "$source" ] && [ ! -L "$source" ] || {
+        APPOFFLOAD_ERROR="Select a local Application Support folder, not a link: $source"
+        return 1
+    }
+    is_application_support_child "$source" || {
+        APPOFFLOAD_ERROR="Source must be an immediate child of $APP_SUPPORT_ROOT"
+        return 1
+    }
+    [ -d "$target" ] && [ -w "$target" ] || {
+        APPOFFLOAD_ERROR="Target is not a mounted writable directory: $target"
+        return 1
+    }
+    if [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" != "1" ]; then
+        case "$target" in "$VOLUMES_ROOT"/*) ;; *)
+            APPOFFLOAD_ERROR="Target must be a mounted volume below $VOLUMES_ROOT"
+            return 1
+        esac
+    fi
+    ensure_compatible_filesystem "$target" || return 1
+    ensure_not_in_use "$source" || return 1
+    acquire_lock || return 1
+
+    name=$(/usr/bin/basename "$source")
+    user_name=${USER:-$(/usr/bin/id -un)}
+    managed_root="$target/$MANAGED_DIR_NAME/$user_name/Application Support"
+    transaction_root="$target/$MANAGED_DIR_NAME/.transactions"
+    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    final="$managed_root/$name"
+    stage="$managed_root/.appoffload-staging-$transaction_id-$name"
+    backup="$APP_SUPPORT_ROOT/.$name.appoffload-backup-$transaction_id"
+    workdir="${TMPDIR:-/tmp}/appoffload-$transaction_id"
+    journal="$transaction_root/$transaction_id.state"
+
+    if [ -e "$final" ] || [ -L "$final" ]; then
+        APPOFFLOAD_ERROR="Destination already exists: $final"
+        release_lock
+        return 1
+    fi
+    total=$(path_bytes "$source") || { APPOFFLOAD_ERROR="Could not measure $source"; release_lock; return 1; }
+    free=$(available_bytes "$target")
+    required=$((total + total / 20 + 67108864))
+    if [ -z "$free" ] || [ "$free" -lt "$required" ]; then
+        APPOFFLOAD_ERROR="Not enough free space: need $(human_bytes "$required"), have $(human_bytes "${free:-0}")."
+        release_lock
+        return 1
+    fi
+
+    /bin/mkdir -p "$managed_root" "$transaction_root" "$workdir" || {
+        APPOFFLOAD_ERROR="Could not create transaction directories on the target."
+        release_lock
+        return 1
+    }
+    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$backup" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir"
+    ACTIVE_PHASE="copying"
+    write_journal "$journal" "$ACTIVE_PHASE"
+    emit_progress "Preflight" 100 "Apps closed; space available"
+
+    if ! copy_with_progress "$source" "$stage" "$total"; then
+        rollback_active_transaction
+        return 1
+    fi
+    if ! verify_trees "$source" "$stage" "$workdir"; then
+        rollback_active_transaction
+        return 1
+    fi
+    ensure_not_in_use "$source" || { rollback_active_transaction; return 1; }
+    copy_verified=1
+    ACTIVE_PHASE="verified"
+    write_journal "$journal" "$ACTIVE_PHASE"
+
+    emit_progress "Switching to symlink" 20 "Committing verified copy"
+    /bin/mv "$stage" "$final" || { APPOFFLOAD_ERROR="Could not commit the external copy."; rollback_active_transaction; return 1; }
+    ACTIVE_STAGE=""
+    /bin/mv "$source" "$backup" || { APPOFFLOAD_ERROR="Could not create the local rollback copy."; rollback_active_transaction; return 1; }
+    ACTIVE_PHASE="source-moved"
+    write_journal "$journal" "$ACTIVE_PHASE"
+    if ! /bin/ln -s "$final" "$source"; then
+        APPOFFLOAD_ERROR="Could not create the symbolic link; the local folder was restored."
+        rollback_active_transaction
+        return 1
+    fi
+    [ "$(/usr/bin/readlink "$source")" = "$final" ] || {
+        APPOFFLOAD_ERROR="Symbolic-link validation failed; the local folder was restored."
+        rollback_active_transaction
+        return 1
+    }
+    emit_progress "Switching to symlink" 100 "Link is active"
+    ACTIVE_PHASE="linked"
+    write_journal "$journal" "$ACTIVE_PHASE"
+
+    emit_progress "Cleaning local copy" 30 "Removing verified rollback copy"
+    case "$backup" in
+        "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) /bin/rm -rf "$backup" ;;
+        *) APPOFFLOAD_ERROR="Safety guard refused to remove unexpected backup path: $backup"; release_lock; return 1 ;;
+    esac
+    emit_progress "Cleaning local copy" 100 "Local space reclaimed"
+    ACTIVE_BACKUP=""
+    ACTIVE_PHASE="complete"
+    write_journal "$journal" "$ACTIVE_PHASE"
+    /bin/rm -rf "$workdir"
+    release_lock
+    clear_active_transaction
+    LAST_LOCAL_DELTA_BYTES=$total
+    LAST_EXTERNAL_BYTES=$total
+    [ "$copy_verified" -eq 1 ]
+}
+
+restore_folder() {
+    local source="$1" destination name transaction_id staging workdir total free required
+    APPOFFLOAD_ERROR=""
+    LAST_LOCAL_DELTA_BYTES=0
+    LAST_EXTERNAL_BYTES=0
+    is_application_support_child "$source" || {
+        APPOFFLOAD_ERROR="Source must be an immediate child of $APP_SUPPORT_ROOT"
+        return 1
+    }
+    destination=$(managed_link_destination "$source" 2>/dev/null) || {
+        APPOFFLOAD_ERROR="This is not a link managed by appoffload: $source"
+        return 1
+    }
+    [ -d "$destination" ] || { APPOFFLOAD_ERROR="External data is unavailable: $destination"; return 1; }
+    ensure_not_in_use "$destination" || return 1
+    acquire_lock || return 1
+    name=$(/usr/bin/basename "$source")
+    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    staging="$APP_SUPPORT_ROOT/.$name.appoffload-restore-$transaction_id"
+    workdir="${TMPDIR:-/tmp}/appoffload-restore-$transaction_id"
+    total=$(path_bytes "$destination") || { APPOFFLOAD_ERROR="Could not measure external data."; release_lock; return 1; }
+    free=$(available_bytes "$APP_SUPPORT_ROOT")
+    required=$((total + total / 20 + 67108864))
+    if [ -z "$free" ] || [ "$free" -lt "$required" ]; then
+        APPOFFLOAD_ERROR="Not enough local space: need $(human_bytes "$required"), have $(human_bytes "${free:-0}")."
+        release_lock
+        return 1
+    fi
+    /bin/mkdir -p "$workdir" || { APPOFFLOAD_ERROR="Could not create restore workspace."; release_lock; return 1; }
+    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$staging" ACTIVE_FINAL="$destination" ACTIVE_WORKDIR="$workdir" ACTIVE_PHASE="restoring"
+
+    copy_with_progress "$destination" "$staging" "$total" || { rollback_active_transaction; return 1; }
+    verify_trees "$destination" "$staging" "$workdir" || { rollback_active_transaction; return 1; }
+    emit_progress "Switching to local" 30 "Replacing managed link"
+    /bin/unlink "$source" || { APPOFFLOAD_ERROR="Could not remove the managed link."; rollback_active_transaction; return 1; }
+    if ! /bin/mv "$staging" "$source"; then
+        /bin/ln -s "$destination" "$source" 2>/dev/null || true
+        APPOFFLOAD_ERROR="Could not activate the restored folder; the external link was recreated."
+        release_lock
+        return 1
+    fi
+    ACTIVE_STAGE=""
+    emit_progress "Switching to local" 100 "Local folder is active"
+    case "$destination" in
+        */"$MANAGED_DIR_NAME"/*/Application\ Support/*) /bin/rm -rf "$destination" ;;
+        *) APPOFFLOAD_ERROR="Restore succeeded, but the safety guard retained the external copy: $destination"; release_lock; return 1 ;;
+    esac
+    /bin/rm -rf "$workdir"
+    release_lock
+    clear_active_transaction
+    LAST_LOCAL_DELTA_BYTES=$((0 - total))
+    LAST_EXTERNAL_BYTES=$total
+    emit_progress "Complete" 100 "External copy removed"
+}
+
+safe_remove_managed_destination() {
+    local destination="$1"
+    is_managed_destination "$destination" || {
+        APPOFFLOAD_ERROR="Safety guard refused unexpected managed-data path: $destination"
+        return 1
+    }
+    /bin/rm -rf "$destination"
+}
+
+move_offload() {
+    local source="$1" target="$2" old_destination name user_name managed_root transaction_root transaction_id
+    local final stage temporary_link workdir journal total free required
+    APPOFFLOAD_ERROR=""
+    LAST_LOCAL_DELTA_BYTES=0
+    LAST_EXTERNAL_BYTES=0
+    is_application_support_child "$source" || {
+        APPOFFLOAD_ERROR="Source must be an immediate child of $APP_SUPPORT_ROOT"
+        return 1
+    }
+    old_destination=$(managed_link_destination "$source" 2>/dev/null) || {
+        APPOFFLOAD_ERROR="This is not a link managed by appoffload: $source"
+        return 1
+    }
+    [ -d "$old_destination" ] || { APPOFFLOAD_ERROR="Current external data is unavailable: $old_destination"; return 1; }
+    [ -d "$target" ] && [ -w "$target" ] || { APPOFFLOAD_ERROR="Target is not a mounted writable directory: $target"; return 1; }
+    if [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" != "1" ]; then
+        case "$target" in "$VOLUMES_ROOT"/*) ;; *) APPOFFLOAD_ERROR="Target must be a mounted volume below $VOLUMES_ROOT"; return 1 ;; esac
+    fi
+    ensure_compatible_filesystem "$target" || return 1
+    ensure_not_in_use "$old_destination" || return 1
+    acquire_lock || return 1
+
+    name=$(/usr/bin/basename "$source")
+    user_name=${USER:-$(/usr/bin/id -un)}
+    managed_root="$target/$MANAGED_DIR_NAME/$user_name/Application Support"
+    transaction_root="$target/$MANAGED_DIR_NAME/.transactions"
+    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    final="$managed_root/$name"
+    stage="$managed_root/.appoffload-staging-$transaction_id-$name"
+    temporary_link="$APP_SUPPORT_ROOT/.$name.appoffload-link-$transaction_id"
+    workdir="${TMPDIR:-/tmp}/appoffload-move-$transaction_id"
+    journal="$transaction_root/$transaction_id.state"
+    if [ "$final" = "$old_destination" ]; then
+        APPOFFLOAD_ERROR="The offload is already stored on that target disk."
+        release_lock
+        return 1
+    fi
+    if [ -e "$final" ] || [ -L "$final" ]; then
+        APPOFFLOAD_ERROR="Destination already exists: $final"
+        release_lock
+        return 1
+    fi
+    total=$(path_bytes "$old_destination") || { APPOFFLOAD_ERROR="Could not measure external data."; release_lock; return 1; }
+    free=$(available_bytes "$target")
+    required=$((total + total / 20 + 67108864))
+    if [ -z "$free" ] || [ "$free" -lt "$required" ]; then
+        APPOFFLOAD_ERROR="Not enough target space: need $(human_bytes "$required"), have $(human_bytes "${free:-0}")."
+        release_lock
+        return 1
+    fi
+    /bin/mkdir -p "$managed_root" "$transaction_root" "$workdir" || {
+        APPOFFLOAD_ERROR="Could not create transaction directories on the new target."
+        release_lock
+        return 1
+    }
+    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir" ACTIVE_LINK_ROLLBACK="$old_destination" ACTIVE_PHASE="moving"
+    write_journal "$journal" "$ACTIVE_PHASE"
+    emit_progress "Preflight" 100 "Source idle; target space available"
+    copy_with_progress "$old_destination" "$stage" "$total" || { rollback_active_transaction; return 1; }
+    verify_trees "$old_destination" "$stage" "$workdir" || { rollback_active_transaction; return 1; }
+    ensure_not_in_use "$old_destination" || { rollback_active_transaction; return 1; }
+    /bin/mv "$stage" "$final" || { APPOFFLOAD_ERROR="Could not commit the new external copy."; rollback_active_transaction; return 1; }
+    ACTIVE_STAGE=""
+    emit_progress "Switching offload" 40 "Retargeting managed link"
+    /bin/ln -s "$final" "$temporary_link" || { APPOFFLOAD_ERROR="Could not prepare the replacement link."; rollback_active_transaction; return 1; }
+    if ! /bin/mv -h "$temporary_link" "$source"; then
+        /bin/unlink "$temporary_link" 2>/dev/null || true
+        APPOFFLOAD_ERROR="Could not activate the replacement link; the old offload remains active."
+        rollback_active_transaction
+        return 1
+    fi
+    [ "$(/usr/bin/readlink "$source")" = "$final" ] || {
+        APPOFFLOAD_ERROR="Replacement-link validation failed; both external copies were retained."
+        release_lock
+        clear_active_transaction
+        return 1
+    }
+    emit_progress "Switching offload" 100 "New external copy is active"
+    ACTIVE_LINK_ROLLBACK=""
+    if ! safe_remove_managed_destination "$old_destination"; then
+        release_lock
+        clear_active_transaction
+        return 1
+    fi
+    /bin/rm -rf "$workdir"
+    ACTIVE_PHASE="complete"
+    write_journal "$journal" "$ACTIVE_PHASE"
+    release_lock
+    clear_active_transaction
+    LAST_EXTERNAL_BYTES=$total
+    emit_progress "Complete" 100 "Old external copy removed"
+}
+
+delete_offload() {
+    local source="$1" destination name transaction_id link_backup total
+    APPOFFLOAD_ERROR=""
+    LAST_LOCAL_DELTA_BYTES=0
+    LAST_EXTERNAL_BYTES=0
+    is_application_support_child "$source" || {
+        APPOFFLOAD_ERROR="Source must be an immediate child of $APP_SUPPORT_ROOT"
+        return 1
+    }
+    destination=$(managed_link_destination "$source" 2>/dev/null) || {
+        APPOFFLOAD_ERROR="This is not a link managed by appoffload: $source"
+        return 1
+    }
+    [ -d "$destination" ] || { APPOFFLOAD_ERROR="External data is unavailable: $destination"; return 1; }
+    ensure_not_in_use "$destination" || return 1
+    acquire_lock || return 1
+    name=$(/usr/bin/basename "$source")
+    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    link_backup="$APP_SUPPORT_ROOT/.$name.appoffload-delete-$transaction_id"
+    total=$(path_bytes "$destination") || { APPOFFLOAD_ERROR="Could not measure external data."; release_lock; return 1; }
+    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$link_backup" ACTIVE_LINK_ROLLBACK="$destination" ACTIVE_PHASE="deleting"
+    if ! /bin/mv -h "$source" "$link_backup"; then
+        APPOFFLOAD_ERROR="Could not deactivate the managed link."
+        release_lock
+        clear_active_transaction
+        return 1
+    fi
+    emit_progress "Deleting offload" 35 "Managed link deactivated"
+    if ! safe_remove_managed_destination "$destination"; then
+        rollback_active_transaction
+        return 1
+    fi
+    [ -L "$link_backup" ] && /bin/unlink "$link_backup"
+    ACTIVE_BACKUP="" ACTIVE_LINK_ROLLBACK=""
+    release_lock
+    clear_active_transaction
+    LAST_EXTERNAL_BYTES=$total
+    emit_progress "Deleting offload" 100 "External data permanently removed"
+}

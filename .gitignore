@@ -1,0 +1,15 @@
+.DS_Store
+._*
+
+# Local screenshots and diagnostic captures
+/Screenshot*.png
+
+# Shell/editor temporary files
+*.log
+*.tmp
+*.swp
+*~
+
+# Test and coverage output
+/coverage/
+/tmp/
