@@ -11,13 +11,13 @@ while [ -L "$SCRIPT_PATH" ]; do
 done
 SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
 PROJECT_DIR=$(cd "$SCRIPT_DIR/.." && pwd -P)
+APPOFFLOAD_VERSION=$(/bin/cat "$PROJECT_DIR/VERSION" 2>/dev/null || echo "development")
 # shellcheck source=../lib/core.sh
 . "$PROJECT_DIR/lib/core.sh"
 
 usage() {
+    printf 'AppSupport Offload %s — safely move ~/Library/Application Support folders\n\n' "$APPOFFLOAD_VERSION"
     cat <<'EOF'
-AppSupport Offload — safely move ~/Library/Application Support folders
-
 Usage:
   appoffload                         Open the interactive TUI
   appoffload list                    List local and offloaded folders
@@ -32,6 +32,7 @@ Usage:
   appoffload offloads delete NAME --yes
   appoffload restore NAME
   appoffload help
+  appoffload version
 
 Offloads are copied with macOS metadata, SHA-256 verified, and activated with
 a symbolic link only after verification. Running apps with open files in the
@@ -144,5 +145,6 @@ case "$command_name" in
         if restore_folder "$source"; then print_cli_summary "Restore" "$(basename "$source")" "$LAST_LOCAL_DELTA_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
         ;;
     help|-h|--help) usage ;;
+    version|-v|--version) echo "appoffload $APPOFFLOAD_VERSION" ;;
     *) usage >&2; exit 2 ;;
 esac

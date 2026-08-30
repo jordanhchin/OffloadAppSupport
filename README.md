@@ -1,5 +1,7 @@
 # AppSupport Offload
 
+Current release: **0.1.0**
+
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
 apps expect by replacing the verified local folder with a symbolic link.
