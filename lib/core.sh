@@ -7,6 +7,7 @@ VOLUMES_ROOT="${APPOFFLOAD_VOLUMES_ROOT:-/Volumes}"
 APPLICATION_ROOTS_OVERRIDE="${APPOFFLOAD_APPLICATION_ROOTS:-}"
 CONFIG_DIR="${APPOFFLOAD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/appoffload}"
 APP_ROOTS_FILE="$CONFIG_DIR/app-roots"
+OFFLOAD_REGISTRY_FILE="$CONFIG_DIR/offloads.tsv"
 PREFERENCES_ROOT="${APPOFFLOAD_PREFERENCES_ROOT:-$HOME/Library/Preferences}"
 SAVED_STATE_ROOT="${APPOFFLOAD_SAVED_STATE_ROOT:-$HOME/Library/Saved Application State}"
 MANAGED_DIR_NAME=".AppSupportOffload"
@@ -23,6 +24,11 @@ ACTIVE_WORKDIR=""
 ACTIVE_COPY_PID=""
 ACTIVE_LINK_ROLLBACK=""
 LOCK_DIR=""
+REGISTRY_SOURCE=""
+REGISTRY_DESTINATION=""
+REGISTRY_VOLUME_ID=""
+REGISTRY_VOLUME_ROOT=""
+REGISTRY_RELATIVE_PATH=""
 
 emit_progress() {
     local phase="$1" percent="$2" detail="${3:-}"
@@ -55,6 +61,115 @@ available_bytes() {
 
 encode_field() {
     printf '%s' "$1" | /usr/bin/base64 | /usr/bin/tr -d '\n'
+}
+
+decode_field() {
+    printf '%s' "$1" | /usr/bin/base64 -D 2>/dev/null
+}
+
+volume_identity() {
+    local volume="$1" identity device
+    if [ -f "$volume/.appoffload-volume-id" ]; then
+        identity=$(/usr/bin/head -n 1 "$volume/.appoffload-volume-id" 2>/dev/null)
+        [ -n "$identity" ] && { printf 'test:%s\n' "$identity"; return; }
+    fi
+    identity=$(/usr/sbin/diskutil info "$volume" 2>/dev/null | /usr/bin/awk -F ': *' '/Volume UUID/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    if [ -n "$identity" ]; then
+        printf 'uuid:%s\n' "$identity"
+        return
+    fi
+    device=$(/bin/df -Pk "$volume" 2>/dev/null | /usr/bin/awk 'NR == 2 {print $1}')
+    [ -n "$device" ] && printf 'device:%s\n' "$device"
+}
+
+volume_root_for_destination() {
+    local destination="$1" volume physical
+    for volume in "$VOLUMES_ROOT"/*; do
+        [ -d "$volume" ] || continue
+        physical=$(cd "$volume" 2>/dev/null && pwd -P) || continue
+        case "$destination" in "$physical"/*|"$volume"/*) printf '%s\n' "$physical"; return 0 ;; esac
+    done
+    return 1
+}
+
+find_volume_by_identity() {
+    local wanted="$1" volume identity
+    [ -n "$wanted" ] || return 1
+    for volume in "$VOLUMES_ROOT"/*; do
+        [ -d "$volume" ] || continue
+        identity=$(volume_identity "$volume")
+        if [ "$identity" = "$wanted" ]; then
+            cd "$volume" 2>/dev/null && pwd -P
+            return
+        fi
+    done
+    return 1
+}
+
+lookup_offload_record() {
+    local wanted="$1" encoded_source encoded_destination encoded_id encoded_root encoded_relative recorded source
+    REGISTRY_SOURCE="" REGISTRY_DESTINATION="" REGISTRY_VOLUME_ID="" REGISTRY_VOLUME_ROOT="" REGISTRY_RELATIVE_PATH=""
+    [ -f "$OFFLOAD_REGISTRY_FILE" ] || return 1
+    while IFS=$'\t' read -r encoded_source encoded_destination encoded_id encoded_root encoded_relative recorded; do
+        [ -n "$encoded_source" ] || continue
+        source=$(decode_field "$encoded_source")
+        [ "$source" = "$wanted" ] || continue
+        REGISTRY_SOURCE="$source"
+        REGISTRY_DESTINATION=$(decode_field "$encoded_destination")
+        REGISTRY_VOLUME_ID=$(decode_field "$encoded_id")
+        REGISTRY_VOLUME_ROOT=$(decode_field "$encoded_root")
+        REGISTRY_RELATIVE_PATH=$(decode_field "$encoded_relative")
+        return 0
+    done < "$OFFLOAD_REGISTRY_FILE"
+    return 1
+}
+
+register_offload() {
+    local source="$1" destination="$2" volume_root="${3:-}" identity relative temp a b c d e f
+    [ -n "$volume_root" ] || volume_root=$(volume_root_for_destination "$destination" 2>/dev/null || true)
+    [ -n "$volume_root" ] || return 1
+    identity=$(volume_identity "$volume_root")
+    [ -n "$identity" ] || return 1
+    case "$destination" in "$volume_root"/*) relative=${destination#"$volume_root"/} ;; *) return 1 ;; esac
+    /bin/mkdir -p "$CONFIG_DIR" || return 1
+    temp=$(/usr/bin/mktemp "$CONFIG_DIR/.offloads.XXXXXX") || return 1
+    if [ -f "$OFFLOAD_REGISTRY_FILE" ]; then
+        while IFS=$'\t' read -r a b c d e f; do
+            [ -n "$a" ] || continue
+            [ "$(decode_field "$a")" = "$source" ] || printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$b" "$c" "$d" "$e" "$f" >> "$temp"
+        done < "$OFFLOAD_REGISTRY_FILE"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(encode_field "$source")" "$(encode_field "$destination")" "$(encode_field "$identity")" \
+        "$(encode_field "$volume_root")" "$(encode_field "$relative")" "$(/bin/date +%s)" >> "$temp"
+    /bin/chmod 600 "$temp"
+    /bin/mv "$temp" "$OFFLOAD_REGISTRY_FILE"
+}
+
+remove_offload_record() {
+    local source="$1" temp a b c d e f found=0
+    [ -f "$OFFLOAD_REGISTRY_FILE" ] || return 0
+    temp=$(/usr/bin/mktemp "$CONFIG_DIR/.offloads.XXXXXX") || return 1
+    while IFS=$'\t' read -r a b c d e f; do
+        [ -n "$a" ] || continue
+        if [ "$(decode_field "$a")" = "$source" ]; then found=1; else printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$b" "$c" "$d" "$e" "$f" >> "$temp"; fi
+    done < "$OFFLOAD_REGISTRY_FILE"
+    /bin/chmod 600 "$temp"
+    /bin/mv "$temp" "$OFFLOAD_REGISTRY_FILE"
+    [ "$found" -ge 0 ]
+}
+
+sync_offload_registry() {
+    local source destination volume_root
+    [ -d "$APP_SUPPORT_ROOT" ] || return 0
+    for source in "$APP_SUPPORT_ROOT"/*; do
+        [ -L "$source" ] || continue
+        destination=$(managed_link_destination "$source" 2>/dev/null || true)
+        [ -d "$destination" ] || continue
+        lookup_offload_record "$source" && continue
+        volume_root=$(volume_root_for_destination "$destination" 2>/dev/null || true)
+        [ -n "$volume_root" ] && register_offload "$source" "$destination" "$volume_root" >/dev/null 2>&1 || true
+    done
 }
 
 is_managed_destination() {
@@ -302,6 +417,191 @@ audit_folders() {
     /bin/rm -rf "$workdir"
 }
 
+absolute_link_destination() {
+    local source="$1" raw destination
+    [ -L "$source" ] || return 1
+    raw=$(/usr/bin/readlink "$source") || return 1
+    case "$raw" in
+        /*) destination="$raw" ;;
+        *) destination="$(cd "$(/usr/bin/dirname "$source")" 2>/dev/null && pwd -P)/$raw" ;;
+    esac
+    printf '%s\n' "$destination"
+}
+
+health_scan() {
+    local a b c d e recorded source destination identity volume_root relative name current mounted candidate detail
+    local volume stage journal phase backup base rest recovered_source user_name managed_root
+    sync_offload_registry
+    if [ -f "$OFFLOAD_REGISTRY_FILE" ]; then
+        while IFS=$'\t' read -r a b c d e recorded; do
+            [ -n "$a" ] || continue
+            source=$(decode_field "$a")
+            destination=$(decode_field "$b")
+            identity=$(decode_field "$c")
+            volume_root=$(decode_field "$d")
+            relative=$(decode_field "$e")
+            name=$(/usr/bin/basename "$source")
+            if [ -L "$source" ]; then
+                current=$(absolute_link_destination "$source" 2>/dev/null || true)
+                if [ -d "$current" ]; then
+                    if [ "$current" != "$destination" ]; then
+                        mounted=$(volume_root_for_destination "$current" 2>/dev/null || true)
+                        [ -n "$mounted" ] && register_offload "$source" "$(cd "$current" && pwd -P)" "$mounted" >/dev/null 2>&1 || true
+                    fi
+                    printf 'ok\thealthy\t%s\t%s\t%s\tActive and reachable\tnone\n' "$name" "$source" "$current"
+                    continue
+                fi
+            elif [ -d "$source" ]; then
+                printf 'warning\tstale-record\t%s\t%s\t%s\tFolder is local; registry entry is stale\tforget-record\n' "$name" "$source" "$destination"
+                continue
+            elif [ -e "$source" ]; then
+                printf 'critical\tpath-conflict\t%s\t%s\t%s\tExpected link path is occupied by another item\tnone\n' "$name" "$source" "$destination"
+                continue
+            fi
+            mounted=$(find_volume_by_identity "$identity" 2>/dev/null || true)
+            if [ -n "$mounted" ]; then
+                candidate="$mounted/$relative"
+                if [ -d "$candidate" ]; then
+                    if [ -L "$source" ]; then detail="Target volume was renamed or remounted"; else detail="Managed link is missing but data is available"; fi
+                    printf 'warning\trepairable-link\t%s\t%s\t%s\t%s\trepair-link\n' "$name" "$source" "$candidate" "$detail"
+                else
+                    printf 'critical\tmissing-data\t%s\t%s\t%s\tTracked disk is mounted but managed data is missing\tnone\n' "$name" "$source" "$candidate"
+                fi
+            else
+                printf 'warning\tdisk-missing\t%s\t%s\t%s\tTracked target disk is not mounted\tnone\n' "$name" "$source" "$destination"
+            fi
+        done < "$OFFLOAD_REGISTRY_FILE"
+    fi
+
+    user_name=${USER:-$(/usr/bin/id -un)}
+    for volume in "$VOLUMES_ROOT"/*; do
+        [ -d "$volume" ] || continue
+        managed_root="$volume/$MANAGED_DIR_NAME/$user_name/Application Support"
+        for stage in "$managed_root"/.appoffload-staging-*; do
+            [ -e "$stage" ] || continue
+            printf 'warning\tstale-staging\t%s\t%s\t%s\tIncomplete staging copy can be removed\tclean-staging\n' "$(/usr/bin/basename "$stage")" "$stage" "$stage"
+        done
+        for journal in "$volume/$MANAGED_DIR_NAME/.transactions"/*.state; do
+            [ -f "$journal" ] || continue
+            phase=$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$journal")
+            case "$phase" in complete|recovered|aborted) continue ;; esac
+            printf 'warning\tincomplete-transaction\t%s\t%s\t%s\tTransaction stopped during phase: %s\trecover-transaction\n' "$(/usr/bin/basename "$journal")" "$journal" "$journal" "${phase:-unknown}"
+        done
+    done
+    for backup in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*; do
+        [ -e "$backup" ] || continue
+        base=$(/usr/bin/basename "$backup")
+        rest=${base#.}
+        name=${rest%%.appoffload-backup-*}
+        recovered_source="$APP_SUPPORT_ROOT/$name"
+        if [ ! -e "$recovered_source" ] && [ ! -L "$recovered_source" ]; then
+            printf 'critical\trecoverable-backup\t%s\t%s\t%s\tLocal rollback copy exists and original path is missing\trecover-backup\n' "$name" "$backup" "$recovered_source"
+        else
+            printf 'warning\tleftover-backup\t%s\t%s\t%s\tRollback copy remains; manual review recommended\tnone\n' "$name" "$backup" "$recovered_source"
+        fi
+    done
+}
+
+repair_offload_link() {
+    local source="$1" mounted candidate name temporary_link
+    APPOFFLOAD_ERROR=""
+    lookup_offload_record "$source" || { APPOFFLOAD_ERROR="No health record exists for: $source"; return 1; }
+    mounted=$(find_volume_by_identity "$REGISTRY_VOLUME_ID" 2>/dev/null || true)
+    [ -n "$mounted" ] || { APPOFFLOAD_ERROR="The recorded target disk is not mounted."; return 1; }
+    candidate="$mounted/$REGISTRY_RELATIVE_PATH"
+    [ -d "$candidate" ] || { APPOFFLOAD_ERROR="Managed data was not found at: $candidate"; return 1; }
+    if [ -d "$source" ] && [ ! -L "$source" ]; then
+        APPOFFLOAD_ERROR="A real folder occupies the link path; it was not overwritten."
+        return 1
+    fi
+    name=$(/usr/bin/basename "$source")
+    temporary_link="$APP_SUPPORT_ROOT/.$name.appoffload-health-link-$$"
+    /bin/ln -s "$candidate" "$temporary_link" || { APPOFFLOAD_ERROR="Could not create the repaired link."; return 1; }
+    if [ -L "$source" ]; then
+        /bin/mv -h "$temporary_link" "$source" || { /bin/unlink "$temporary_link" 2>/dev/null || true; APPOFFLOAD_ERROR="Could not replace the broken link."; return 1; }
+    elif ! /bin/mv "$temporary_link" "$source"; then
+        /bin/unlink "$temporary_link" 2>/dev/null || true
+        APPOFFLOAD_ERROR="Could not restore the missing link."
+        return 1
+    fi
+    [ "$(absolute_link_destination "$source")" = "$candidate" ] || { APPOFFLOAD_ERROR="Repaired-link validation failed."; return 1; }
+    register_offload "$source" "$(cd "$candidate" && pwd -P)" "$mounted" >/dev/null 2>&1 || true
+}
+
+is_health_staging_path() {
+    case "$1" in
+        "$VOLUMES_ROOT"/*/"$MANAGED_DIR_NAME"/*/Application\ Support/.appoffload-staging-*) return 0 ;;
+        *)
+            [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" = "1" ] && case "$1" in
+                */"$MANAGED_DIR_NAME"/*/Application\ Support/.appoffload-staging-*) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+}
+
+is_health_journal_path() {
+    case "$1" in
+        "$VOLUMES_ROOT"/*/"$MANAGED_DIR_NAME"/.transactions/*.state) return 0 ;;
+        *)
+            [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" = "1" ] && case "$1" in
+                */"$MANAGED_DIR_NAME"/.transactions/*.state) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+}
+
+clean_health_staging() {
+    local stage="$1"
+    APPOFFLOAD_ERROR=""
+    is_health_staging_path "$stage" || { APPOFFLOAD_ERROR="Safety guard refused unexpected staging path: $stage"; return 1; }
+    [ -e "$stage" ] || { APPOFFLOAD_ERROR="Staging path no longer exists."; return 1; }
+    ensure_not_in_use "$stage" || return 1
+    /bin/rm -rf "$stage"
+}
+
+recover_local_backup() {
+    local backup="$1" base rest name source
+    APPOFFLOAD_ERROR=""
+    case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) ;; *) APPOFFLOAD_ERROR="Safety guard refused unexpected backup path."; return 1 ;; esac
+    [ -e "$backup" ] || { APPOFFLOAD_ERROR="Backup no longer exists."; return 1; }
+    base=$(/usr/bin/basename "$backup"); rest=${base#.}; name=${rest%%.appoffload-backup-*}; source="$APP_SUPPORT_ROOT/$name"
+    if [ -e "$source" ] || [ -L "$source" ]; then APPOFFLOAD_ERROR="Original path is occupied; backup was not changed."; return 1; fi
+    /bin/mv "$backup" "$source" || { APPOFFLOAD_ERROR="Could not restore the local rollback copy."; return 1; }
+}
+
+recover_incomplete_transaction() {
+    local journal="$1" phase encoded source backup stage final temp
+    APPOFFLOAD_ERROR=""
+    is_health_journal_path "$journal" || { APPOFFLOAD_ERROR="Safety guard refused unexpected transaction record."; return 1; }
+    [ -f "$journal" ] || { APPOFFLOAD_ERROR="Transaction record no longer exists."; return 1; }
+    phase=$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$journal")
+    encoded=$(/usr/bin/awk -F= '$1 == "source" {print substr($0, index($0, "=")+1); exit}' "$journal"); source=$(decode_field "$encoded")
+    encoded=$(/usr/bin/awk -F= '$1 == "backup" {print substr($0, index($0, "=")+1); exit}' "$journal"); backup=$(decode_field "$encoded")
+    encoded=$(/usr/bin/awk -F= '$1 == "stage" {print substr($0, index($0, "=")+1); exit}' "$journal"); stage=$(decode_field "$encoded")
+    encoded=$(/usr/bin/awk -F= '$1 == "final" {print substr($0, index($0, "=")+1); exit}' "$journal"); final=$(decode_field "$encoded")
+    is_application_support_child "$source" || { APPOFFLOAD_ERROR="Transaction source failed its safety check."; return 1; }
+    if [ -n "$backup" ]; then
+        case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) ;; *) APPOFFLOAD_ERROR="Transaction rollback path failed its safety check."; return 1 ;; esac
+    fi
+    [ -z "$stage" ] || is_health_staging_path "$stage" || { APPOFFLOAD_ERROR="Transaction staging path failed its safety check."; return 1; }
+    [ -z "$final" ] || is_managed_destination "$final" || { APPOFFLOAD_ERROR="Transaction destination failed its safety check."; return 1; }
+    if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+            /bin/mv "$backup" "$source" || { APPOFFLOAD_ERROR="Could not restore the transaction rollback copy."; return 1; }
+        elif [ -L "$source" ] && [ -d "$(absolute_link_destination "$source" 2>/dev/null)" ]; then
+            case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-*) /bin/rm -rf "$backup" ;; esac
+        else
+            APPOFFLOAD_ERROR="Transaction needs manual review because both source and rollback data exist."
+            return 1
+        fi
+    fi
+    if [ -n "$stage" ] && [ -e "$stage" ]; then clean_health_staging "$stage" || return 1; fi
+    temp="${journal}.repair-$$"
+    /usr/bin/awk -F= 'BEGIN {OFS="="} $1 == "phase" {$2="recovered"} {print}' "$journal" > "$temp" && /bin/mv "$temp" "$journal"
+}
+
 processes_using() {
     local path="$1" current_pid="" current_command=""
     local lsof_bin="${APPOFFLOAD_LSOF:-/usr/sbin/lsof}"
@@ -402,7 +702,6 @@ copy_with_progress() {
     wait "$pid"
     status=$?
     ACTIVE_COPY_PID=""
-    ACTIVE_LINK_ROLLBACK=""
     [ "$status" -eq 0 ] || {
         APPOFFLOAD_ERROR="ditto could not copy the folder (exit $status)."
         return "$status"
@@ -467,6 +766,7 @@ clear_active_transaction() {
     ACTIVE_FINAL=""
     ACTIVE_WORKDIR=""
     ACTIVE_COPY_PID=""
+    ACTIVE_LINK_ROLLBACK=""
 }
 
 rollback_active_transaction() {
@@ -606,6 +906,7 @@ offload_folder() {
     ACTIVE_BACKUP=""
     ACTIVE_PHASE="complete"
     write_journal "$journal" "$ACTIVE_PHASE"
+    register_offload "$source" "$(cd "$final" && pwd -P)" "$(cd "$target" && pwd -P)" >/dev/null 2>&1 || true
     /bin/rm -rf "$workdir"
     release_lock
     clear_active_transaction
@@ -661,6 +962,7 @@ restore_folder() {
         */"$MANAGED_DIR_NAME"/*/Application\ Support/*) /bin/rm -rf "$destination" ;;
         *) APPOFFLOAD_ERROR="Restore succeeded, but the safety guard retained the external copy: $destination"; release_lock; return 1 ;;
     esac
+    remove_offload_record "$source" >/dev/null 2>&1 || true
     /bin/rm -rf "$workdir"
     release_lock
     clear_active_transaction
@@ -763,6 +1065,7 @@ move_offload() {
         clear_active_transaction
         return 1
     fi
+    register_offload "$source" "$(cd "$final" && pwd -P)" "$(cd "$target" && pwd -P)" >/dev/null 2>&1 || true
     /bin/rm -rf "$workdir"
     ACTIVE_PHASE="complete"
     write_journal "$journal" "$ACTIVE_PHASE"
@@ -805,6 +1108,7 @@ delete_offload() {
         return 1
     fi
     [ -L "$link_backup" ] && /bin/unlink "$link_backup"
+    remove_offload_record "$source" >/dev/null 2>&1 || true
     ACTIVE_BACKUP="" ACTIVE_LINK_ROLLBACK=""
     release_lock
     clear_active_transaction

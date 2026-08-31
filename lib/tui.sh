@@ -529,6 +529,71 @@ tui_manage_app_roots() {
     done
 }
 
+tui_health_center() {
+    local report severity status name source destination detail action index selected issues healthy result
+    local health_sources=() health_destinations=() health_details=() health_actions=() health_statuses=()
+    while true; do
+        report=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-health.XXXXXX") || return
+        draw_header "Scanning offload health"
+        printf '\n  %sChecking links, target identities, transactions, and rollback artifacts…%s\n' "$C_CYAN" "$C_RESET"
+        health_scan > "$report"
+        issues=$(/usr/bin/awk -F '\t' '$1 != "ok" {n++} END {print n+0}' "$report")
+        healthy=$(/usr/bin/awk -F '\t' '$1 == "ok" {n++} END {print n+0}' "$report")
+        MENU_LABELS=() MENU_VALUES=()
+        health_sources=() health_destinations=() health_details=() health_actions=() health_statuses=()
+        index=0
+        while IFS=$'\t' read -r severity status name source destination detail action; do
+            [ -n "$status" ] || continue
+            case "$severity" in ok) result="OK" ;; critical) result="CRITICAL" ;; *) result="WARNING" ;; esac
+            MENU_LABELS+=("$(printf '%-10s %-24s %s' "$result" "$(truncate_text "$name" 24)" "$detail")")
+            MENU_VALUES+=("$index")
+            health_sources+=("$source")
+            health_destinations+=("$destination")
+            health_details+=("$detail")
+            health_actions+=("$action")
+            health_statuses+=("$status")
+            index=$((index + 1))
+        done < <(/usr/bin/awk -F '\t' 'BEGIN {OFS="\t"} $1 == "critical" {rank=1} $1 == "warning" {rank=2} $1 == "ok" {rank=3} {print rank, $0}' "$report" | /usr/bin/sort -t $'\t' -k1,1n | /usr/bin/cut -f2-)
+        /bin/rm -f "$report"
+        if [ "${#MENU_VALUES[@]}" -eq 0 ]; then
+            show_result 1 "No registered offloads or recovery artifacts were found."
+            return
+        fi
+        menu_select "Health and Repair — $issues issue(s), $healthy healthy" "↑/↓ navigate  •  Enter inspect/repair  •  q back" || return
+        selected="$SELECTED_VALUE"
+        source=${health_sources[$selected]}
+        destination=${health_destinations[$selected]}
+        detail=${health_details[$selected]}
+        action=${health_actions[$selected]}
+        status=${health_statuses[$selected]}
+        case "$action" in
+            repair-link)
+                confirm_action "Repair managed link" "$detail" "Retarget the link to $destination? No app data will be copied or deleted." || continue
+                if repair_offload_link "$source"; then show_result 1 "Managed link repaired and registry updated."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+                ;;
+            forget-record)
+                confirm_action "Remove stale health record" "$detail" "The local folder and external data will not be changed." || continue
+                if remove_offload_record "$source"; then show_result 1 "Stale registry record removed."; else show_result 0 "Could not update the health registry."; fi
+                ;;
+            clean-staging)
+                confirm_action "Remove stale staging data" "$detail" "Delete this incomplete copy: $source" || continue
+                if clean_health_staging "$source"; then show_result 1 "Stale staging data removed."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+                ;;
+            recover-backup)
+                confirm_action "Recover local rollback copy" "$detail" "Restore it to $destination?" || continue
+                if recover_local_backup "$source"; then show_result 1 "Local rollback copy restored."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+                ;;
+            recover-transaction)
+                confirm_action "Recover interrupted transaction" "$detail" "Restore rollback data and remove incomplete staging when safe?" || continue
+                if recover_incomplete_transaction "$source"; then show_result 1 "Interrupted transaction recovered."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+                ;;
+            *)
+                if [ "$status" = "healthy" ]; then show_result 1 "$detail — $destination"; else show_result 0 "$detail — $destination"; fi
+                ;;
+        esac
+    done
+}
+
 print_session_summary() {
     local action
     printf '\n%sSession summary%s\n' "$C_BOLD" "$C_RESET"
@@ -553,17 +618,19 @@ run_tui() {
         MENU_LABELS=(
             "Offload a local Application Support folder"
             "Manage existing offloads"
+            "Health and repair center"
             "Scan Application Support folders and sizes"
             "Compare installed apps and get recommendations"
             "Manage installed-app search locations"
             "Quit"
         )
-        MENU_VALUES=("offload" "manage" "inventory" "audit" "locations" "quit")
+        MENU_VALUES=("offload" "manage" "health" "inventory" "audit" "locations" "quit")
         menu_select "Move large app data off your local disk—safely" "↑/↓ navigate  •  Enter select  •  q quit" || break
         action="$SELECTED_VALUE"
         case "$action" in
             offload) tui_offload ;;
             manage) tui_manage_offloads ;;
+            health) tui_health_center ;;
             inventory) tui_inventory ;;
             audit) tui_app_audit ;;
             locations) tui_manage_app_roots ;;

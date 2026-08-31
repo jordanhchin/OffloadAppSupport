@@ -1,6 +1,6 @@
 # AppSupport Offload
 
-Current release: **0.1.0**
+Current release: **0.2.0**
 
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
@@ -21,6 +21,8 @@ scriptable CLI with a polished terminal interface.
 - Offload and restore workflows
 - Unified offload management: restore, verified cross-drive move, or permanent
   deletion
+- Health and Repair Center for broken links, renamed or missing disks, stale
+  staging copies, rollback data, and interrupted transactions
 - Running-process protection using macOS `lsof`
 - APFS / Mac OS Extended filesystem guard
 - Metadata-preserving copies using macOS `ditto` (ACLs, xattrs, resource forks)
@@ -70,8 +72,29 @@ appoffload offloads
 appoffload offloads restore "Claude"
 appoffload offloads move "Claude" --target "/Volumes/Second SSD"
 appoffload offloads delete "Claude" --yes
+appoffload health
+appoffload health repair "Claude"
 appoffload restore "Claude"
 ```
+
+### Health and Repair Center
+
+Choose **Health and repair center** in the TUI, or run `appoffload health`, to
+check every known offload plus transaction and recovery artifacts. AppSupport
+Offload records each target disk's stable volume identity in
+`~/.config/appoffload/offloads.tsv`; this lets it find the same disk after its
+volume name or mount path changes.
+
+The scanner distinguishes healthy links from unavailable disks, missing managed
+data, local path conflicts, stale registry entries, incomplete staging copies,
+interrupted transactions, and recoverable rollback folders. Only issues with a
+bounded safe repair offer an action. Every mutation is confirmed in the TUI;
+destructive or recovery-oriented CLI actions require `--yes`.
+
+Link repair is atomic and does not move app data. Cleanup and recovery commands
+are constrained to AppSupport Offload's managed paths. A real folder at the
+expected local path is never overwritten, and final verified external data is
+never automatically deleted by the Health Center.
 
 ### Managing offloads
 
@@ -187,6 +210,8 @@ such as exFAT because they cannot faithfully preserve all macOS metadata.
 ./scripts/check.sh
 ```
 
-The test suite performs a complete temporary offload and restore, checks file
-content and extended attributes, and verifies process-guard and destination-
-conflict behavior. It never operates on the real Application Support folder.
+The test suite performs complete temporary offload, restore, and cross-drive
+transactions; checks file content and extended attributes; exercises target-disk
+rename and link repair, interrupted-transaction recovery, cleanup path guards,
+process protection, and destination conflicts. It never operates on the real
+Application Support folder.

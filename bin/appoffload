@@ -30,6 +30,12 @@ Usage:
   appoffload offloads restore NAME
   appoffload offloads move NAME --target /Volumes/DISK
   appoffload offloads delete NAME --yes
+  appoffload health                  Scan links, disks, and recovery artifacts
+  appoffload health repair NAME      Repair a renamed-volume or missing link
+  appoffload health forget NAME --yes
+  appoffload health clean-staging PATH --yes
+  appoffload health recover-backup PATH --yes
+  appoffload health recover-transaction PATH --yes
   appoffload restore NAME
   appoffload help
   appoffload version
@@ -130,6 +136,41 @@ case "$command_name" in
                 [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { echo "Permanent deletion requires: appoffload offloads delete NAME --yes" >&2; exit 2; }
                 source=$(resolve_source "$3")
                 if delete_offload "$source"; then print_external_summary "Permanent deletion" "$(basename "$source")" "$LAST_EXTERNAL_BYTES"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        ;;
+    health)
+        health_action="${2:-scan}"
+        case "$health_action" in
+            scan)
+                [ "$#" -le 2 ] || { usage >&2; exit 2; }
+                printf '%-10s %-24s %-28s %s\n' "SEVERITY" "STATUS" "ITEM" "DETAIL"
+                while IFS=$'\t' read -r severity status name source destination detail action; do
+                    printf '%-10s %-24s %-28s %s\n' "$(printf '%s' "$severity" | tr '[:lower:]' '[:upper:]')" "$status" "$(printf '%.28s' "$name")" "$detail"
+                done < <(health_scan)
+                ;;
+            repair)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                source=$(resolve_source "$3")
+                if repair_offload_link "$source"; then echo "Repaired managed link: $source"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            forget)
+                [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
+                source=$(resolve_source "$3")
+                if remove_offload_record "$source"; then echo "Removed health record: $source"; else echo "Error: could not update registry" >&2; exit 1; fi
+                ;;
+            clean-staging)
+                [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
+                if clean_health_staging "$3"; then echo "Removed stale staging data: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            recover-backup)
+                [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
+                if recover_local_backup "$3"; then echo "Recovered local rollback copy: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            recover-transaction)
+                [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
+                if recover_incomplete_transaction "$3"; then echo "Recovered transaction: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
             *) usage >&2; exit 2 ;;
         esac

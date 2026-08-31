@@ -147,4 +147,71 @@ remove_app_root "$SAVED_ROOT" || fail "$APPOFFLOAD_ERROR"
 custom_app_roots | /usr/bin/awk -v p="$SAVED_ROOT" '$0 == p {found=1} END {exit found}' || fail "custom root was not removed"
 [ -d "$TEST_ROOT/Temporarily Unmounted" ] || fail "removing search location changed app files"
 
-echo "PASS: offload, restore, move, delete, guards, audit, and persistent locations"
+# Health center: persist identity, detect a renamed target volume, repair both a
+# dangling and a missing link, clean staging, and recover interrupted rollback.
+HEALTH_OLD="$APPOFFLOAD_VOLUMES_ROOT/HealthOld"
+HEALTH_NEW="$APPOFFLOAD_VOLUMES_ROOT/HealthRenamed"
+HEALTH_SOURCE="$APP_SUPPORT_ROOT/Health App"
+mkdir -p "$HEALTH_OLD" "$HEALTH_SOURCE"
+printf 'health-volume-id\n' > "$HEALTH_OLD/.appoffload-volume-id"
+printf 'healthy data\n' > "$HEALTH_SOURCE/state.db"
+offload_folder "$HEALTH_SOURCE" "$HEALTH_OLD" || fail "$APPOFFLOAD_ERROR"
+lookup_offload_record "$HEALTH_SOURCE" || fail "offload registry record was not created"
+HEALTH_REPORT="$TEST_ROOT/health.tsv"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$HEALTH_SOURCE" '$2 == "healthy" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "healthy offload was not reported"
+
+mv "$HEALTH_OLD" "$HEALTH_NEW"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$HEALTH_SOURCE" '$2 == "repairable-link" && $4 == p && $7 == "repair-link" {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "renamed-volume link was not repairable"
+repair_offload_link "$HEALTH_SOURCE" || fail "$APPOFFLOAD_ERROR"
+HEALTH_NEW_PHYSICAL=$(cd "$HEALTH_NEW" && pwd -P)
+case "$(readlink "$HEALTH_SOURCE")" in "$HEALTH_NEW_PHYSICAL"/*) ;; *) fail "health repair did not retarget renamed volume" ;; esac
+
+unlink "$HEALTH_SOURCE"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$HEALTH_SOURCE" '$2 == "repairable-link" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "missing managed link was not detected"
+repair_offload_link "$HEALTH_SOURCE" || fail "$APPOFFLOAD_ERROR"
+assert_link "$HEALTH_SOURCE"
+
+unlink "$HEALTH_SOURCE"
+mkdir "$HEALTH_SOURCE"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$HEALTH_SOURCE" '$2 == "stale-record" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "local path conflict was not reported"
+if repair_offload_link "$HEALTH_SOURCE"; then fail "health repair overwrote a real local folder"; fi
+rmdir "$HEALTH_SOURCE"
+repair_offload_link "$HEALTH_SOURCE" || fail "$APPOFFLOAD_ERROR"
+
+STALE_STAGE="$HEALTH_NEW/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/.appoffload-staging-test"
+mkdir -p "$STALE_STAGE"
+printf 'partial\n' > "$STALE_STAGE/partial"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$STALE_STAGE" '$2 == "stale-staging" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "stale staging was not detected"
+clean_health_staging "$STALE_STAGE" || fail "$APPOFFLOAD_ERROR"
+[ ! -e "$STALE_STAGE" ] || fail "stale staging was not removed"
+
+TXN_SOURCE="$APP_SUPPORT_ROOT/Interrupted App"
+TXN_BACKUP="$APP_SUPPORT_ROOT/.Interrupted App.appoffload-backup-test"
+TXN_STAGE="$HEALTH_NEW/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/.appoffload-staging-transaction"
+TXN_JOURNAL="$HEALTH_NEW/$MANAGED_DIR_NAME/.transactions/interrupted.state"
+mkdir -p "$TXN_BACKUP" "$TXN_STAGE" "$(dirname "$TXN_JOURNAL")"
+printf 'rollback data\n' > "$TXN_BACKUP/state"
+{
+    printf 'version=1\nphase=source-moved\n'
+    printf 'source=%s\n' "$(encode_field "$TXN_SOURCE")"
+    printf 'backup=%s\n' "$(encode_field "$TXN_BACKUP")"
+    printf 'stage=%s\n' "$(encode_field "$TXN_STAGE")"
+    printf 'final=%s\n' "$(encode_field "")"
+} > "$TXN_JOURNAL"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$TXN_JOURNAL" '$2 == "incomplete-transaction" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "interrupted transaction was not detected"
+recover_incomplete_transaction "$TXN_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+assert_dir "$TXN_SOURCE"
+[ ! -e "$TXN_STAGE" ] || fail "transaction staging remained after recovery"
+[ "$(/usr/bin/awk -F= '$1 == "phase" {print $2}' "$TXN_JOURNAL")" = "recovered" ] || fail "transaction was not marked recovered"
+
+if clean_health_staging "$TEST_ROOT/not-managed/.AppSupportOffload/user/Application Support/.appoffload-staging-bad"; then
+    fail "staging cleanup accepted a path outside the volume root"
+fi
+
+echo "PASS: transactions, health repair, guards, audit, and persistent locations"
