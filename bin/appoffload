@@ -14,6 +14,9 @@ PROJECT_DIR=$(cd "$SCRIPT_DIR/.." && pwd -P)
 APPOFFLOAD_VERSION=$(/bin/cat "$PROJECT_DIR/VERSION" 2>/dev/null || echo "development")
 # shellcheck source=../lib/core.sh
 . "$PROJECT_DIR/lib/core.sh"
+# shellcheck source=../lib/migration.sh
+. "$PROJECT_DIR/lib/migration.sh"
+trap 'rollback_active_transaction; exit 130' INT TERM
 
 usage() {
     printf 'AppSupport Offload %s — safely move ~/Library/Application Support folders\n\n' "$APPOFFLOAD_VERSION"
@@ -36,6 +39,11 @@ Usage:
   appoffload health clean-staging PATH --yes
   appoffload health recover-backup PATH --yes
   appoffload health recover-transaction PATH --yes
+  appoffload app inspect APP
+  appoffload app backup APP --target /Volumes/DISK
+  appoffload app backups
+  appoffload app verify BACKUP_PATH
+  appoffload app restore BACKUP_PATH [--app-target DIRECTORY]
   appoffload restore NAME
   appoffload help
   appoffload version
@@ -171,6 +179,40 @@ case "$command_name" in
             recover-transaction)
                 [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
                 if recover_incomplete_transaction "$3"; then echo "Recovered transaction: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        ;;
+    app)
+        app_action="${2:-}"
+        case "$app_action" in
+            inspect)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                app_path=$(resolve_migratable_app "$3") || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                printf '%-10s %12s  %-16s %s\n' "CATEGORY" "SIZE" "SOURCE" "PATH"
+                while IFS=$'\t' read -r size category relative source; do printf '%-10s %12s  %-16s %s\n' "$category" "$(human_bytes "$size")" "$(migration_source_kind "$source")" "$source"; done < <(app_migration_inventory "$app_path")
+                ;;
+            backup)
+                [ "$#" -eq 5 ] && [ "$4" = "--target" ] || { usage >&2; exit 2; }
+                app_path=$(resolve_migratable_app "$3") || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                if create_app_migration_backup "$app_path" "$5"; then
+                    printf '\nMigration backup complete: %s\nItems: %s (%s existing offload(s) materialized)\nData copied: %s\nBackup: %s\nLocal disk usage unchanged.\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_ITEM_COUNT" "$LAST_MIGRATION_OFFLOADED_COUNT" "$(human_bytes "$LAST_EXTERNAL_BYTES")" "$LAST_MIGRATION_BACKUP"
+                else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            backups)
+                [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+                printf '%-30s %-34s %12s  %s\n' "APP" "BUNDLE ID" "SIZE" "CREATED"
+                while IFS=$'\t' read -r size name identifier created path; do printf '%-30s %-34s %12s  %s\n' "$(printf '%.30s' "$name")" "$(printf '%.34s' "$identifier")" "$(human_bytes "$size")" "$created"; printf '  %s\n' "$path"; done < <(list_app_migration_backups)
+                ;;
+            verify)
+                [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+                if verify_app_migration_backup "$3"; then echo "Migration backup verified: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                ;;
+            restore)
+                if [ "$#" -eq 3 ]; then app_target=""; elif [ "$#" -eq 5 ] && [ "$4" = "--app-target" ]; then app_target="$5"; else usage >&2; exit 2; fi
+                if restore_app_migration_backup "$3" "$app_target"; then
+                    printf '\nMigration restore complete: %s\nItems: %s\nLocal space consumed: %s\nThe migration backup was retained.\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_ITEM_COUNT" "$(human_bytes "$((0 - LAST_LOCAL_DELTA_BYTES))")"
+                else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
             *) usage >&2; exit 2 ;;
         esac

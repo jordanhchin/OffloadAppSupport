@@ -594,6 +594,85 @@ tui_health_center() {
     done
 }
 
+load_migratable_app_menu() {
+    local size name identifier path
+    MENU_LABELS=() MENU_VALUES=()
+    while IFS=$'\t' read -r size name identifier path; do
+        [ -n "$path" ] || continue
+        MENU_LABELS+=("$(printf '%-30s %10s  %s' "$(truncate_text "$name" 30)" "$(human_bytes "$size")" "$identifier")")
+        MENU_VALUES+=("$path")
+    done < <(list_migratable_apps | /usr/bin/sort -t $'\t' -k2,2)
+}
+
+load_migration_backup_menu() {
+    local size name identifier created path
+    MENU_LABELS=() MENU_VALUES=()
+    while IFS=$'\t' read -r size name identifier created path; do
+        [ -n "$path" ] || continue
+        MENU_LABELS+=("$(printf '%-28s %10s  %s' "$(truncate_text "$name" 28)" "$(human_bytes "$size")" "$created")")
+        MENU_VALUES+=("$path")
+    done < <(list_app_migration_backups | /usr/bin/sort -t $'\t' -k4,4r)
+}
+
+tui_create_app_migration() {
+    local app target report count total name size category relative source offloaded=0
+    load_migratable_app_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No installed apps were found in the configured search locations."; return; fi
+    menu_select "Choose an app to back up for migration" "↑/↓ navigate  •  Enter scan  •  q back" || return
+    app="$SELECTED_VALUE"; name=$(/usr/bin/basename "$app" .app)
+    report=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-migration-preview.XXXXXX") || return
+    draw_header "Discovering data associated with $name"
+    printf '\n  %sScanning the app bundle and user Library locations…%s\n' "$C_CYAN" "$C_RESET"
+    if ! app_migration_inventory "$app" > "$report"; then /bin/rm -f "$report"; show_result 0 "$APPOFFLOAD_ERROR"; return; fi
+    count=$(/usr/bin/awk 'END {print NR+0}' "$report"); total=$(/usr/bin/awk -F '\t' '{sum += $1} END {printf "%.0f", sum+0}' "$report")
+    while IFS=$'\t' read -r size category relative source; do [ "$(migration_source_kind "$source")" = "OFFLOADED" ] && offloaded=$((offloaded + 1)); done < "$report"
+    /bin/rm -f "$report"
+    load_volume_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No writable external volumes are mounted."; return; fi
+    menu_select "Choose the migration-backup disk" "↑/↓ navigate  •  Enter select  •  q back" || return
+    target="$SELECTED_VALUE"
+    confirm_action "Confirm complete-app backup" "$name: $count items, $(human_bytes "$total"); $offloaded offload(s) will be materialized" "Copy to $(/usr/bin/basename "$target") and keep all originals unchanged?" || return
+    if create_app_migration_backup "$app" "$target"; then
+        SESSION_ACTIONS+=("Backed up $LAST_MIGRATION_APP_NAME for migration — $(human_bytes "$LAST_EXTERNAL_BYTES") copied; local disk unchanged")
+        show_result 1 "$LAST_MIGRATION_APP_NAME and $LAST_MIGRATION_ITEM_COUNT items were verified."
+    else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_restore_app_migration() {
+    local backup
+    load_migration_backup_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
+    menu_select "Choose a complete-app backup to restore" "↑/↓ navigate  •  Enter select  •  q back" || return
+    backup="$SELECTED_VALUE"
+    confirm_action "Confirm complete-app restore" "Verify and restore this app plus all discovered user Library data?" "Existing files are never overwritten; the backup remains on the removable disk." || return
+    if restore_app_migration_backup "$backup" ""; then
+        record_action "Restored migration backup for" "$LAST_MIGRATION_APP_NAME" "$LAST_LOCAL_DELTA_BYTES"
+        show_result 1 "$LAST_MIGRATION_APP_NAME and $LAST_MIGRATION_ITEM_COUNT items were restored."
+    else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_verify_app_migration() {
+    local backup
+    load_migration_backup_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
+    menu_select "Choose a complete-app backup to verify" "↑/↓ navigate  •  Enter verify  •  q back" || return
+    backup="$SELECTED_VALUE"
+    draw_header "Verifying complete-app backup"
+    printf '\n  %sRecomputing SHA-256 checksums for the entire portable package…%s\n' "$C_CYAN" "$C_RESET"
+    if verify_app_migration_backup "$backup"; then show_result 1 "Every item in the migration backup matches its manifest."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_app_migration() {
+    local action
+    while true; do
+        MENU_LABELS=("Create a complete-app migration backup" "Restore a complete-app migration backup" "Verify a migration backup" "Back to main menu")
+        MENU_VALUES=("backup" "restore" "verify" "back")
+        menu_select "Complete-app migration" "↑/↓ navigate  •  Enter select  •  q back" || return
+        action="$SELECTED_VALUE"
+        case "$action" in backup) tui_create_app_migration ;; restore) tui_restore_app_migration ;; verify) tui_verify_app_migration ;; back) return ;; esac
+    done
+}
+
 print_session_summary() {
     local action
     printf '\n%sSession summary%s\n' "$C_BOLD" "$C_RESET"
@@ -618,18 +697,20 @@ run_tui() {
         MENU_LABELS=(
             "Offload a local Application Support folder"
             "Manage existing offloads"
+            "Back up or restore a complete app"
             "Health and repair center"
             "Scan Application Support folders and sizes"
             "Compare installed apps and get recommendations"
             "Manage installed-app search locations"
             "Quit"
         )
-        MENU_VALUES=("offload" "manage" "health" "inventory" "audit" "locations" "quit")
+        MENU_VALUES=("offload" "manage" "migration" "health" "inventory" "audit" "locations" "quit")
         menu_select "Move large app data off your local disk—safely" "↑/↓ navigate  •  Enter select  •  q quit" || break
         action="$SELECTED_VALUE"
         case "$action" in
             offload) tui_offload ;;
             manage) tui_manage_offloads ;;
+            migration) tui_app_migration ;;
             health) tui_health_center ;;
             inventory) tui_inventory ;;
             audit) tui_app_audit ;;

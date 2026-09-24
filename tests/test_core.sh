@@ -12,12 +12,16 @@ export APPOFFLOAD_APPLICATION_ROOTS="$TEST_ROOT/Applications"
 export APPOFFLOAD_CONFIG_DIR="$TEST_ROOT/config"
 export APPOFFLOAD_PREFERENCES_ROOT="$TEST_ROOT/Library/Preferences"
 export APPOFFLOAD_SAVED_STATE_ROOT="$TEST_ROOT/Library/Saved Application State"
+export APPOFFLOAD_USER_LIBRARY_ROOT="$TEST_ROOT/Library"
+export APPOFFLOAD_USER_APPLICATIONS_ROOT="$TEST_ROOT/User Applications"
 export APPOFFLOAD_ALLOW_ANY_TARGET=1
 mkdir -p "$APPOFFLOAD_APP_SUPPORT_ROOT" "$APPOFFLOAD_VOLUMES_ROOT/External" "$APPOFFLOAD_VOLUMES_ROOT/External2" \
     "$APPOFFLOAD_APPLICATION_ROOTS" "$APPOFFLOAD_PREFERENCES_ROOT" "$APPOFFLOAD_SAVED_STATE_ROOT"
 
 # shellcheck source=../lib/core.sh
 . "$ROOT/lib/core.sh"
+# shellcheck source=../lib/migration.sh
+. "$ROOT/lib/migration.sh"
 
 ui_progress() { :; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -147,6 +151,58 @@ remove_app_root "$SAVED_ROOT" || fail "$APPOFFLOAD_ERROR"
 custom_app_roots | /usr/bin/awk -v p="$SAVED_ROOT" '$0 == p {found=1} END {exit found}' || fail "custom root was not removed"
 [ -d "$TEST_ROOT/Temporarily Unmounted" ] || fail "removing search location changed app files"
 
+# Complete-app migration materializes an existing managed offload into a
+# portable backup, includes other associated Library data, verifies the package,
+# and restores into a clean simulated new Mac without overwriting collisions.
+MIGRATION_APP="$APPOFFLOAD_APPLICATION_ROOTS/Migrator.app"
+MIGRATION_SUPPORT="$APP_SUPPORT_ROOT/com.example.Migrator"
+MIGRATION_PREF="$APPOFFLOAD_USER_LIBRARY_ROOT/Preferences/com.example.Migrator.plist"
+MIGRATION_CONTAINER="$APPOFFLOAD_USER_LIBRARY_ROOT/Containers/com.example.Migrator"
+mkdir -p "$MIGRATION_APP/Contents" "$MIGRATION_SUPPORT" "$MIGRATION_CONTAINER"
+cat > "$MIGRATION_APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.example.Migrator</string>
+<key>CFBundleName</key><string>Migrator</string>
+<key>CFBundleShortVersionString</key><string>4.2</string>
+</dict></plist>
+PLIST
+printf 'app executable payload\n' > "$MIGRATION_APP/Contents/MacOS-data"
+printf 'offloaded user state\n' > "$MIGRATION_SUPPORT/state.db"
+printf 'preference data\n' > "$MIGRATION_PREF"
+printf 'sandbox data\n' > "$MIGRATION_CONTAINER/container.db"
+offload_folder "$MIGRATION_SUPPORT" "$TARGET" || fail "$APPOFFLOAD_ERROR"
+MIGRATION_EXTERNAL=$(managed_link_destination "$MIGRATION_SUPPORT") || fail "migration fixture was not offloaded"
+create_app_migration_backup "$MIGRATION_APP" "$TARGET2" || fail "$APPOFFLOAD_ERROR"
+MIGRATION_BACKUP="$LAST_MIGRATION_BACKUP"
+[ "$LAST_MIGRATION_OFFLOADED_COUNT" -eq 1 ] || fail "migration did not report materializing the managed offload"
+[ -d "$MIGRATION_BACKUP" ] || fail "migration backup was not committed"
+verify_app_migration_backup "$MIGRATION_BACKUP" || fail "$APPOFFLOAD_ERROR"
+assert_file "$MIGRATION_BACKUP/payload/Library/Application Support/com.example.Migrator/state.db"
+[ ! -L "$MIGRATION_BACKUP/payload/Library/Application Support/com.example.Migrator" ] || fail "migration backup preserved the offload symlink instead of its data"
+assert_file "$MIGRATION_EXTERNAL/state.db"
+assert_link "$MIGRATION_SUPPORT"
+
+NEW_LIBRARY="$TEST_ROOT/New Mac/Library"
+NEW_APPS="$TEST_ROOT/New Mac/Applications"
+mkdir -p "$NEW_LIBRARY" "$NEW_APPS"
+USER_LIBRARY_ROOT="$NEW_LIBRARY"
+USER_APPLICATIONS_ROOT="$NEW_APPS"
+restore_app_migration_backup "$MIGRATION_BACKUP" "$NEW_APPS" || fail "$APPOFFLOAD_ERROR"
+assert_dir "$NEW_APPS/Migrator.app"
+assert_dir "$NEW_LIBRARY/Application Support/com.example.Migrator"
+assert_file "$NEW_LIBRARY/Application Support/com.example.Migrator/state.db"
+assert_file "$NEW_LIBRARY/Preferences/com.example.Migrator.plist"
+assert_file "$NEW_LIBRARY/Containers/com.example.Migrator/container.db"
+if restore_app_migration_backup "$MIGRATION_BACKUP" "$NEW_APPS"; then fail "migration restore overwrote existing data"; fi
+assert_contains "$APPOFFLOAD_ERROR" "refused to overwrite"
+printf 'tamper\n' >> "$MIGRATION_BACKUP/payload/Library/Application Support/com.example.Migrator/state.db"
+if verify_app_migration_backup "$MIGRATION_BACKUP"; then fail "migration verification accepted modified payload data"; fi
+assert_contains "$APPOFFLOAD_ERROR" "checksum verification failed"
+USER_LIBRARY_ROOT="$APPOFFLOAD_USER_LIBRARY_ROOT"
+USER_APPLICATIONS_ROOT="$APPOFFLOAD_USER_APPLICATIONS_ROOT"
+
 # Health center: persist identity, detect a renamed target volume, repair both a
 # dangling and a missing link, clean staging, and recover interrupted rollback.
 HEALTH_OLD="$APPOFFLOAD_VOLUMES_ROOT/HealthOld"
@@ -214,4 +270,4 @@ if clean_health_staging "$TEST_ROOT/not-managed/.AppSupportOffload/user/Applicat
     fail "staging cleanup accepted a path outside the volume root"
 fi
 
-echo "PASS: transactions, health repair, guards, audit, and persistent locations"
+echo "PASS: transactions, migration, health repair, guards, audit, and persistent locations"

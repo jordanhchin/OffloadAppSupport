@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-09-24
+
+- Add portable, non-destructive complete-app migration backups for moving to a
+  new Mac.
+- Discover and package the `.app` bundle plus conservatively associated user
+  Library data, including Application Support, containers, group containers,
+  preferences, caches, saved state, scripts, web/HTTP storage, cookies, logs,
+  and matching launch agents.
+- Materialize managed Application Support offloads into the backup so an app
+  already offloaded by this tool restores as normal local data on the new Mac.
+- Add self-contained metadata and SHA-256 manifests, standalone verification,
+  guarded transactional restore, collision refusal, and TUI/CLI workflows.
+
 ## 0.2.0 — 2026-08-30
 
 - Add an interactive Health and Repair Center and matching scriptable commands.

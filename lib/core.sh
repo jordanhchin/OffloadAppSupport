@@ -787,6 +787,9 @@ rollback_active_transaction() {
     if [ -n "$ACTIVE_LINK_ROLLBACK" ] && [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
         /bin/ln -s "$ACTIVE_LINK_ROLLBACK" "$ACTIVE_SOURCE" 2>/dev/null || true
     fi
+    if type rollback_migration_commits >/dev/null 2>&1; then
+        rollback_migration_commits
+    fi
     if [ -n "$ACTIVE_STAGE" ] && [ -e "$ACTIVE_STAGE" ]; then
         case "$ACTIVE_STAGE" in
             */.appoffload-staging-*) /bin/rm -rf "$ACTIVE_STAGE" ;;

@@ -1,6 +1,6 @@
 # AppSupport Offload
 
-Current release: **0.2.0**
+Current release: **0.3.0**
 
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
@@ -23,6 +23,9 @@ scriptable CLI with a polished terminal interface.
   deletion
 - Health and Repair Center for broken links, renamed or missing disks, stale
   staging copies, rollback data, and interrupted transactions
+- Portable complete-app migration backups containing an app bundle and its
+  conservatively discovered user Library data—even when Application Support is
+  already offloaded
 - Running-process protection using macOS `lsof`
 - APFS / Mac OS Extended filesystem guard
 - Metadata-preserving copies using macOS `ditto` (ACLs, xattrs, resource forks)
@@ -74,8 +77,58 @@ appoffload offloads move "Claude" --target "/Volumes/Second SSD"
 appoffload offloads delete "Claude" --yes
 appoffload health
 appoffload health repair "Claude"
+appoffload app inspect "/Applications/Claude.app"
+appoffload app backup "/Applications/Claude.app" --target "/Volumes/External SSD"
+appoffload app backups
+appoffload app verify "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
+appoffload app restore "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload restore "Claude"
 ```
+
+### Complete-app migration
+
+Choose **Back up or restore a complete app** to prepare an app for a new Mac.
+Unlike a live offload, a migration backup is deliberately non-destructive: the
+installed app and its current data remain unchanged. Backups are stored at:
+
+```text
+/Volumes/<disk>/.AppSupportOffload/App Backups/<bundle-id>/<timestamp>.appbackup
+```
+
+The scanner begins with the app's bundle identifier, display name, and signed
+application-group entitlements. It then conservatively includes matching items
+from these user locations:
+
+- The installed `.app` bundle
+- `~/Library/Application Support`
+- `~/Library/Containers` and `~/Library/Group Containers`
+- `~/Library/Application Scripts`
+- `~/Library/Preferences` and `Preferences/ByHost`
+- `~/Library/Caches`, `Logs`, `Saved Application State`, `WebKit`, and
+  `HTTPStorages`
+- Matching cookies and per-user launch agents
+
+If an included Application Support folder is already a managed offload, the
+backup follows that symlink and copies the real external contents. The portable
+package therefore contains a normal directory—not a link back to the old disk.
+If the offload disk is unavailable, creation fails rather than producing an
+incomplete backup. Apps that have never been offloaded use the same workflow
+from their normal local paths.
+
+Each `.appbackup` package contains its own item map, source metadata, and full
+SHA-256 payload manifest. Restore verifies the package first, copies it into
+local staging, verifies that copy, and then activates all items transactionally.
+It refuses the entire restore if any target already exists, never overwrites a
+new Mac's data, and retains the removable-disk backup afterward. Apps originally
+installed in `/Applications` return there by default; other apps return to
+`~/Applications`. The CLI `--app-target` option can select another app folder.
+
+Discovery is intentionally conservative because macOS has no authoritative
+app-to-file ownership database. Review `appoffload app inspect APP` before the
+backup if the app stores data in unusually named folders. System-wide data under
+`/Library`, Keychain passwords, cloud-only content, licenses tied to hardware,
+and data owned by other users are not included. Keep the old Mac and an
+independent backup until each restored app has been opened and validated.
 
 ### Health and Repair Center
 
@@ -202,6 +255,13 @@ such as exFAT because they cannot faithfully preserve all macOS metadata.
   to a new local folder.
 - Some sandboxed or security-sensitive apps reject data reached through an
   external symlink. If an app behaves that way, quit it and use **Restore**.
+- Migration discovery may require Full Disk Access for Terminal (or whichever
+  host launches the tool) to read protected containers. An unreadable selected
+  item causes the backup to fail; it is not silently omitted during copying.
+- Apps with privileged helpers, system extensions, hardware-bound licenses, or
+  Mac App Store/account requirements may still need to be reinstalled or
+  re-authorized. The migration package covers the app bundle and matched
+  per-user Library data, not privileged files under `/Library` or `/System`.
 - This is not a backup. Keep a separate current backup of both disks.
 
 ## Development checks
@@ -210,8 +270,9 @@ such as exFAT because they cannot faithfully preserve all macOS metadata.
 ./scripts/check.sh
 ```
 
-The test suite performs complete temporary offload, restore, and cross-drive
-transactions; checks file content and extended attributes; exercises target-disk
-rename and link repair, interrupted-transaction recovery, cleanup path guards,
-process protection, and destination conflicts. It never operates on the real
-Application Support folder.
+The test suite performs complete temporary offload, restore, cross-drive, and
+whole-app migration transactions; checks file content and extended attributes;
+materializes an already-offloaded folder into a portable backup; exercises
+collision refusal, target-disk rename and link repair, interrupted-transaction
+recovery, cleanup path guards, process protection, and destination conflicts.
+It never operates on the real Application Support folder.
