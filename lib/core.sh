@@ -19,6 +19,7 @@ ACTIVE_PHASE=""
 ACTIVE_SOURCE=""
 ACTIVE_BACKUP=""
 ACTIVE_STAGE=""
+ACTIVE_STAGE_ID=""
 ACTIVE_FINAL=""
 ACTIVE_WORKDIR=""
 ACTIVE_COPY_PID=""
@@ -64,6 +65,11 @@ path_bytes() {
     blocks=${blocks%%[[:space:]]*}
     case "$blocks" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$((blocks * 1024))"
+}
+
+directory_identity() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
 }
 
 available_bytes() {
@@ -619,7 +625,7 @@ recover_local_backup() {
 }
 
 recover_incomplete_transaction() {
-    local journal="$1" phase encoded source backup stage final old_destination operation current="" workdir
+    local journal="$1" phase encoded source backup stage stage_identity final old_destination operation current="" workdir
     APPOFFLOAD_ERROR=""
     is_health_journal_path "$journal" || { APPOFFLOAD_ERROR="Safety guard refused unexpected transaction record."; return 1; }
     [ -f "$journal" ] || { APPOFFLOAD_ERROR="Transaction record no longer exists."; return 1; }
@@ -627,6 +633,7 @@ recover_incomplete_transaction() {
     encoded=$(/usr/bin/awk -F= '$1 == "source" {print substr($0, index($0, "=")+1); exit}' "$journal"); source=$(decode_field "$encoded")
     encoded=$(/usr/bin/awk -F= '$1 == "backup" {print substr($0, index($0, "=")+1); exit}' "$journal"); backup=$(decode_field "$encoded")
     encoded=$(/usr/bin/awk -F= '$1 == "stage" {print substr($0, index($0, "=")+1); exit}' "$journal"); stage=$(decode_field "$encoded")
+    stage_identity=$(/usr/bin/awk -F= '$1 == "stage_identity" {print $2; exit}' "$journal")
     encoded=$(/usr/bin/awk -F= '$1 == "final" {print substr($0, index($0, "=")+1); exit}' "$journal"); final=$(decode_field "$encoded")
     encoded=$(/usr/bin/awk -F= '$1 == "old_destination" {print substr($0, index($0, "=")+1); exit}' "$journal"); old_destination=$(decode_field "$encoded")
     operation=$(/usr/bin/awk -F= '$1 == "operation" {print $2; exit}' "$journal")
@@ -665,9 +672,12 @@ recover_incomplete_transaction() {
             if [ -d "$source" ] && [ ! -L "$source" ]; then
                 if [ -d "$final" ]; then
                     if [ "$phase" != "local-active" ] && [ "$phase" != "removing-external" ]; then
-                        workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-restore-repair.XXXXXX") || return 1
-                        verify_trees "$final" "$source" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
-                        /bin/rm -rf "$workdir"
+                        if [ "$phase" != "restoring" ] || [ -z "$stage_identity" ] || [ -e "$stage" ] || [ -L "$stage" ] ||
+                           [ "$(directory_identity "$source" 2>/dev/null || true)" != "$stage_identity" ]; then
+                            workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-restore-repair.XXXXXX") || return 1
+                            verify_trees "$final" "$source" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
+                            /bin/rm -rf "$workdir"
+                        fi
                     fi
                     safe_remove_managed_destination "$final" || return 1
                 fi
@@ -881,6 +891,7 @@ write_journal() {
         printf 'source=%s\n' "$(encode_field "$ACTIVE_SOURCE")"
         printf 'backup=%s\n' "$(encode_field "$ACTIVE_BACKUP")"
         printf 'stage=%s\n' "$(encode_field "$ACTIVE_STAGE")"
+        printf 'stage_identity=%s\n' "$ACTIVE_STAGE_ID"
         printf 'final=%s\n' "$(encode_field "$ACTIVE_FINAL")"
         printf 'old_destination=%s\n' "$(encode_field "$ACTIVE_OLD_DESTINATION")"
         printf 'operation=%s\n' "$ACTIVE_OPERATION"
@@ -900,6 +911,7 @@ clear_active_transaction() {
     ACTIVE_SOURCE=""
     ACTIVE_BACKUP=""
     ACTIVE_STAGE=""
+    ACTIVE_STAGE_ID=""
     ACTIVE_FINAL=""
     ACTIVE_WORKDIR=""
     ACTIVE_COPY_PID=""
@@ -1137,6 +1149,8 @@ restore_folder() {
 
     copy_with_progress "$destination" "$staging" "$total" || { rollback_active_transaction; return 1; }
     verify_trees "$destination" "$staging" "$workdir" || { rollback_active_transaction; return 1; }
+    ACTIVE_STAGE_ID=$(directory_identity "$staging") || { APPOFFLOAD_ERROR="Could not identify the verified restore copy."; rollback_active_transaction; return 1; }
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not record the verified restore copy."; rollback_active_transaction; return 1; }
     emit_progress "Switching to local" 30 "Replacing managed link"
     /bin/unlink "$source" || { APPOFFLOAD_ERROR="Could not remove the managed link."; rollback_active_transaction; return 1; }
     if ! /bin/mv "$staging" "$source"; then

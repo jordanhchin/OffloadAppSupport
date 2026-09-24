@@ -471,6 +471,40 @@ recover_incomplete_transaction "$RESTORE_LIVE_JOURNAL" || fail "$APPOFFLOAD_ERRO
 [ ! -e "$RESTORE_OLD_FINAL" ] || fail "restore recovery retained the old external copy"
 [ "$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$RESTORE_LIVE_JOURNAL")" = "recovered" ] || fail "live restore journal remained incomplete"
 
+RENAME_WINDOW_SOURCE="$APP_SUPPORT_ROOT/Restore Rename Window"
+RENAME_WINDOW_STAGE="$APP_SUPPORT_ROOT/.Restore Rename Window.appoffload-restore-test"
+RENAME_WINDOW_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Restore Rename Window"
+RENAME_WINDOW_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/restore-rename-window.state"
+mkdir -p "$RENAME_WINDOW_STAGE" "$RENAME_WINDOW_FINAL"
+printf 'original data\n' > "$RENAME_WINDOW_STAGE/state"
+printf 'original data\n' > "$RENAME_WINDOW_FINAL/state"
+ACTIVE_SOURCE="$RENAME_WINDOW_SOURCE" ACTIVE_STAGE="$RENAME_WINDOW_STAGE" ACTIVE_STAGE_ID=$(directory_identity "$RENAME_WINDOW_STAGE")
+ACTIVE_FINAL="$RENAME_WINDOW_FINAL" ACTIVE_OPERATION="restore" ACTIVE_PHASE="restoring"
+write_journal "$RENAME_WINDOW_JOURNAL" "$ACTIVE_PHASE" || fail "could not write restore rename fixture"
+/bin/mv "$RENAME_WINDOW_STAGE" "$RENAME_WINDOW_SOURCE"
+printf 'new app changes\n' > "$RENAME_WINDOW_SOURCE/state"
+clear_active_transaction
+recover_incomplete_transaction "$RENAME_WINDOW_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+[ "$(/bin/cat "$RENAME_WINDOW_SOURCE/state")" = "new app changes" ] || fail "rename-window recovery lost local changes"
+[ ! -e "$RENAME_WINDOW_FINAL" ] || fail "rename-window recovery retained the old external copy"
+
+CONFLICT_SOURCE="$APP_SUPPORT_ROOT/Restore Path Conflict"
+CONFLICT_STAGE="$APP_SUPPORT_ROOT/.Restore Path Conflict.appoffload-restore-test"
+CONFLICT_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Restore Path Conflict"
+CONFLICT_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/restore-path-conflict.state"
+mkdir -p "$CONFLICT_SOURCE" "$CONFLICT_STAGE" "$CONFLICT_FINAL"
+printf 'different local data\n' > "$CONFLICT_SOURCE/state"
+printf 'original data\n' > "$CONFLICT_STAGE/state"
+printf 'original data\n' > "$CONFLICT_FINAL/state"
+ACTIVE_SOURCE="$CONFLICT_SOURCE" ACTIVE_STAGE="$CONFLICT_STAGE" ACTIVE_STAGE_ID=$(directory_identity "$CONFLICT_STAGE")
+ACTIVE_FINAL="$CONFLICT_FINAL" ACTIVE_OPERATION="restore" ACTIVE_PHASE="restoring"
+write_journal "$CONFLICT_JOURNAL" "$ACTIVE_PHASE" || fail "could not write restore conflict fixture"
+clear_active_transaction
+if recover_incomplete_transaction "$CONFLICT_JOURNAL"; then fail "restore recovery accepted a different local folder"; fi
+assert_file "$CONFLICT_SOURCE/state"
+assert_file "$CONFLICT_FINAL/state"
+assert_file "$CONFLICT_STAGE/state"
+
 DELETE_REPAIR_SOURCE="$APP_SUPPORT_ROOT/Interrupted Delete"
 DELETE_REPAIR_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Delete"
 DELETE_REPAIR_BACKUP="$APP_SUPPORT_ROOT/.Interrupted Delete.appoffload-delete-test"

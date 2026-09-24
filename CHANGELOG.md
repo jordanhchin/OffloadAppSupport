@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.4 — 2026-09-24
+
+- Record the verified local staging directory's filesystem identity before a
+  restore switches paths. Recovery recognizes that directory after an
+  interrupted rename, even if the app has since changed its files.
+- Keep the content comparison for a different local directory so recovery
+  does not discard external data when the path has been occupied by a conflict.
+
 ## 0.4.3 — 2026-09-24
 
 - Preserve the complete external copy if an offload is interrupted while its
