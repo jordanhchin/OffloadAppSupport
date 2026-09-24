@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.3 — 2026-09-24
+
+- Preserve the complete external copy if an offload is interrupted while its
+  local rollback folder is being deleted; recovery finishes that cleanup.
+- Accept a numeric `du` subtotal when an unreadable child makes `du` exit with
+  an error, while still rejecting missing or malformed totals.
+- Let recovery finish an active local restore even if the app has since changed
+  its local files.
+
 ## 0.4.2 — 2026-09-24
 
 - Clean failed local restore copies and surface abandoned restore staging in the

@@ -58,7 +58,9 @@ human_bytes() {
 
 path_bytes() {
     local path="$1" blocks
-    blocks=$(/usr/bin/du -sk "$path" 2>/dev/null) || return 1
+    # du can report a usable subtotal while returning nonzero for one unreadable
+    # child. A missing or malformed total is still an error.
+    blocks=$(/usr/bin/du -sk "$path" 2>/dev/null) || true
     blocks=${blocks%%[[:space:]]*}
     case "$blocks" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$((blocks * 1024))"
@@ -662,7 +664,7 @@ recover_incomplete_transaction() {
         restore)
             if [ -d "$source" ] && [ ! -L "$source" ]; then
                 if [ -d "$final" ]; then
-                    if [ "$phase" != "removing-external" ]; then
+                    if [ "$phase" != "local-active" ] && [ "$phase" != "removing-external" ]; then
                         workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-restore-repair.XXXXXX") || return 1
                         verify_trees "$final" "$source" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
                         /bin/rm -rf "$workdir"
@@ -914,7 +916,9 @@ rollback_active_transaction() {
         wait "$ACTIVE_COPY_PID" 2>/dev/null || true
         ACTIVE_COPY_PID=""
     fi
-    if [ "$ACTIVE_OPERATION" != "delete" ] || [ "$ACTIVE_PHASE" != "removing-external" ]; then
+    case "$ACTIVE_OPERATION:$ACTIVE_PHASE" in
+    delete:removing-external|offload:removing-local) ;;
+    *)
         if [ -n "$ACTIVE_BACKUP" ] && { [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; }; then
             if [ -L "$ACTIVE_SOURCE" ]; then
                 /bin/unlink "$ACTIVE_SOURCE" 2>/dev/null || true
@@ -926,7 +930,8 @@ rollback_active_transaction() {
         if [ -n "$ACTIVE_LINK_ROLLBACK" ] && [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
             /bin/ln -s "$ACTIVE_LINK_ROLLBACK" "$ACTIVE_SOURCE" 2>/dev/null || true
         fi
-    fi
+        ;;
+    esac
     if type rollback_migration_commits >/dev/null 2>&1; then
         rollback_migration_commits
     fi
@@ -939,10 +944,15 @@ rollback_active_transaction() {
         [ -L "$ACTIVE_SOURCE" ] && current=$(absolute_link_destination "$ACTIVE_SOURCE" 2>/dev/null || true)
         case "$ACTIVE_OPERATION" in
             offload)
-                if [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] && [ -d "$ACTIVE_FINAL" ]; then
-                    safe_remove_managed_destination "$ACTIVE_FINAL" || clean=0
-                fi
-                [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] || clean=0
+                case "$ACTIVE_PHASE" in
+                    copying|verified|source-moved|linked)
+                        if [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] && [ -d "$ACTIVE_FINAL" ]; then
+                            safe_remove_managed_destination "$ACTIVE_FINAL" || clean=0
+                        fi
+                        [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] || clean=0
+                        ;;
+                    *) clean=0 ;;
+                esac
                 ;;
             move)
                 if same_destination "$current" "$ACTIVE_OLD_DESTINATION" && [ -d "$ACTIVE_FINAL" ]; then

@@ -69,6 +69,17 @@ if health_scan | /usr/bin/awk -F '\t' '$2 == "incomplete-transaction" {found=1} 
     fail "cleanly rolled-back restore was reported as incomplete"
 fi
 if path_bytes "$TEST_ROOT/no-such-folder" >/dev/null; then fail "unmeasurable folder was treated as zero bytes"; fi
+PARTLY_UNREADABLE="$TEST_ROOT/Partly Unreadable"
+mkdir -p "$PARTLY_UNREADABLE/restricted"
+printf 'readable data\n' > "$PARTLY_UNREADABLE/readable"
+printf 'private data\n' > "$PARTLY_UNREADABLE/restricted/private"
+chmod 000 "$PARTLY_UNREADABLE/restricted"
+if [ "$(/usr/bin/id -u)" -ne 0 ] && /usr/bin/du -sk "$PARTLY_UNREADABLE" >/dev/null 2>&1; then
+    fail "unreadable-folder fixture did not make du report an error"
+fi
+PARTIAL_SIZE=$(path_bytes "$PARTLY_UNREADABLE") || fail "du subtotal was rejected for a partially unreadable folder"
+[ "$PARTIAL_SIZE" -gt 0 ] || fail "du subtotal was not numeric"
+chmod 700 "$PARTLY_UNREADABLE/restricted"
 
 restore_folder "$SOURCE" || fail "$APPOFFLOAD_ERROR"
 assert_dir "$SOURCE"
@@ -421,6 +432,44 @@ health_scan > "$HEALTH_REPORT"
 recover_incomplete_transaction "$ORPHAN_JOURNAL" || fail "$APPOFFLOAD_ERROR"
 assert_dir "$ORPHAN_SOURCE"
 [ ! -e "$ORPHAN_FINAL" ] || fail "interrupted offload left an orphan external copy"
+
+INTERRUPTED_CLEANUP_SOURCE="$APP_SUPPORT_ROOT/Interrupted Local Cleanup"
+INTERRUPTED_CLEANUP_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Local Cleanup"
+INTERRUPTED_CLEANUP_BACKUP="$APP_SUPPORT_ROOT/.Interrupted Local Cleanup.appoffload-backup-test"
+INTERRUPTED_CLEANUP_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/interrupted-local-cleanup.state"
+mkdir -p "$INTERRUPTED_CLEANUP_FINAL" "$INTERRUPTED_CLEANUP_BACKUP"
+printf 'complete external data\n' > "$INTERRUPTED_CLEANUP_FINAL/complete"
+printf 'partial local data\n' > "$INTERRUPTED_CLEANUP_BACKUP/partial"
+ln -s "$INTERRUPTED_CLEANUP_FINAL" "$INTERRUPTED_CLEANUP_SOURCE"
+ACTIVE_SOURCE="$INTERRUPTED_CLEANUP_SOURCE" ACTIVE_BACKUP="$INTERRUPTED_CLEANUP_BACKUP" ACTIVE_STAGE="" ACTIVE_FINAL="$INTERRUPTED_CLEANUP_FINAL"
+ACTIVE_JOURNAL="$INTERRUPTED_CLEANUP_JOURNAL" ACTIVE_OPERATION="offload" ACTIVE_PHASE="removing-local"
+write_journal "$INTERRUPTED_CLEANUP_JOURNAL" "$ACTIVE_PHASE" || fail "could not write interrupted cleanup fixture"
+rollback_active_transaction
+assert_link "$INTERRUPTED_CLEANUP_SOURCE"
+assert_file "$INTERRUPTED_CLEANUP_FINAL/complete"
+assert_file "$INTERRUPTED_CLEANUP_BACKUP/partial"
+[ "$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$INTERRUPTED_CLEANUP_JOURNAL")" = "removing-local" ] || fail "interrupted local deletion was incorrectly marked aborted"
+recover_incomplete_transaction "$INTERRUPTED_CLEANUP_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+assert_link "$INTERRUPTED_CLEANUP_SOURCE"
+assert_file "$INTERRUPTED_CLEANUP_FINAL/complete"
+[ ! -e "$INTERRUPTED_CLEANUP_BACKUP" ] || fail "recovery retained the partial local copy"
+
+RESTORE_LIVE_SOURCE="$APP_SUPPORT_ROOT/Interrupted Live Restore"
+RESTORE_OLD_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Live Restore"
+RESTORE_LIVE_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/interrupted-live-restore.state"
+mkdir -p "$RESTORE_LIVE_SOURCE" "$RESTORE_OLD_FINAL"
+printf 'new local changes\n' > "$RESTORE_LIVE_SOURCE/state"
+printf 'older external data\n' > "$RESTORE_OLD_FINAL/state"
+{
+    printf 'version=1\nphase=local-active\noperation=restore\n'
+    printf 'source=%s\n' "$(encode_field "$RESTORE_LIVE_SOURCE")"
+    printf 'backup=%s\nstage=%s\n' "$(encode_field "")" "$(encode_field "")"
+    printf 'final=%s\n' "$(encode_field "$RESTORE_OLD_FINAL")"
+} > "$RESTORE_LIVE_JOURNAL"
+recover_incomplete_transaction "$RESTORE_LIVE_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+[ "$(/bin/cat "$RESTORE_LIVE_SOURCE/state")" = "new local changes" ] || fail "restore recovery changed the live local folder"
+[ ! -e "$RESTORE_OLD_FINAL" ] || fail "restore recovery retained the old external copy"
+[ "$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$RESTORE_LIVE_JOURNAL")" = "recovered" ] || fail "live restore journal remained incomplete"
 
 DELETE_REPAIR_SOURCE="$APP_SUPPORT_ROOT/Interrupted Delete"
 DELETE_REPAIR_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Delete"
