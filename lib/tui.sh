@@ -26,7 +26,7 @@ tui_cleanup() {
 
 tui_enter() {
     printf '\033[?1049h\033[?25l'
-    trap 'rollback_active_transaction; tui_cleanup; exit 130' INT TERM
+    trap 'debug_log "signal received in TUI; rolling back operation=$ACTIVE_OPERATION phase=$ACTIVE_PHASE"; rollback_active_transaction; tui_cleanup; exit 130' INT TERM
 }
 
 terminal_width() {
@@ -217,10 +217,14 @@ ui_progress() {
     printf '  %s%s%s  %3s%%\n' "$C_CYAN" "$bar" "$C_RESET" "$percent"
     printf '\n  %s%s%s\n' "$C_DIM" "$detail" "$C_RESET"
     printf '\n  %sDo not disconnect the target disk.%s\n' "$C_YELLOW" "$C_RESET"
+    if [ -n "$APPOFFLOAD_DEBUG_LOG" ]; then
+        printf '  %sDebug log: %s%s\n' "$C_DIM" "$(truncate_text "$APPOFFLOAD_DEBUG_LOG" "$(( $(terminal_width) - 15 ))")" "$C_RESET"
+    fi
 }
 
 show_result() {
     local success="$1" message="$2"
+    debug_log "result success=$success message=$message"
     draw_header "Operation result"
     if [ "$success" = "1" ]; then
         printf '\n  %s✓ %s%s\n' "$C_GREEN" "$message" "$C_RESET"
@@ -267,6 +271,7 @@ record_action() {
     else
         SESSION_ACTIONS+=("$verb $name — $(human_bytes "$((0 - delta))") additionally consumed locally")
     fi
+    debug_log "tui.action verb=$verb name=$name local_delta_bytes=$delta"
 }
 
 tui_offload() {
@@ -357,6 +362,7 @@ tui_manage_offloads() {
         MENU_VALUES=("restore" "move" "delete" "back")
         menu_select "Manage $name" "↑/↓ navigate  •  Enter select  •  q back" || continue
         action="$SELECTED_VALUE"
+        debug_log "tui.manage-offloads action=$action source=$source"
         case "$action" in
             restore) tui_restore_source "$source" ;;
             move) tui_move_offload_source "$source" ;;
@@ -758,6 +764,7 @@ print_session_summary() {
             printf '  Net local disk change: 0 B\n'
         fi
     fi
+    [ -z "$APPOFFLOAD_DEBUG_LOG" ] || printf '  Debug log: %s\n' "$APPOFFLOAD_DEBUG_LOG"
 }
 
 run_tui() {
@@ -777,6 +784,7 @@ run_tui() {
         MENU_VALUES=("offload" "manage" "migration" "health" "inventory" "audit" "locations" "quit")
         menu_select "Move large app data off your local disk—safely" "↑/↓ navigate  •  Enter select  •  q quit" || break
         action="$SELECTED_VALUE"
+        debug_log "tui.menu action=$action"
         case "$action" in
             offload) tui_offload ;;
             manage) tui_manage_offloads ;;

@@ -242,24 +242,29 @@ app_migration_inventory() {
 
 migration_verify_pair() {
     local source="$1" destination="$2" workdir="$3" label="$4" source_manifest destination_manifest
+    debug_log "migration-verify.begin label=$label source=$source destination=$destination"
     if [ -L "$source" ]; then
         [ -L "$destination" ] && [ "$(/usr/bin/readlink "$source")" = "$(/usr/bin/readlink "$destination")" ] || { APPOFFLOAD_ERROR="Symlink verification failed for $label"; return 1; }
     elif [ -f "$source" ]; then
         [ -f "$destination" ] && /usr/bin/cmp -s "$source" "$destination" || { APPOFFLOAD_ERROR="File verification failed for $label"; return 1; }
     elif [ -d "$source" ]; then
         source_manifest="$workdir/source-$label.tsv"; destination_manifest="$workdir/destination-$label.tsv"
+        emit_progress "Verifying backup" 0 "Hashing source: $label"
         create_manifest "$source" "$source_manifest" || return 1
+        emit_progress "Verifying backup" 50 "Hashing destination: $label"
         create_manifest "$destination" "$destination_manifest" || return 1
         /usr/bin/cmp -s "$source_manifest" "$destination_manifest" || { APPOFFLOAD_ERROR="SHA-256 verification failed for $label"; return 1; }
     else
         APPOFFLOAD_ERROR="Unsupported migration item: $source"
         return 1
     fi
+    debug_log "migration-verify.done label=$label"
 }
 
 create_app_migration_folder_backup() {
     local app="$1" target="$2" inventory total free required id safe_id timestamp root final stage payload workdir
     local count=0 index=0 offloaded_count=0 size category relative source actual destination encoded_source
+    debug_log "migration-folder-backup.begin app=$app target=$target mode=${3:-native}"
     APPOFFLOAD_ERROR=""; LAST_EXTERNAL_BYTES=0; LAST_LOCAL_DELTA_BYTES=0; LAST_MIGRATION_BACKUP=""; LAST_MIGRATION_ITEM_COUNT=0; LAST_MIGRATION_OFFLOADED_COUNT=0
     migration_app_info "$app" || return 1
     [ -d "$target" ] && [ -w "$target" ] || { APPOFFLOAD_ERROR="Target is not a mounted writable directory: $target"; return 1; }
@@ -295,7 +300,9 @@ create_app_migration_folder_backup() {
         copy_with_progress "$actual" "$destination" "$size" || { rollback_active_transaction; /bin/rm -f "$inventory"; return 1; }
         migration_verify_pair "$actual" "$destination" "$workdir" "$index" || { rollback_active_transaction; /bin/rm -f "$inventory"; return 1; }
     done < "$inventory"
+    emit_progress "Cataloging backup" 0 "Hashing complete payload"
     create_manifest "$payload" "$stage/checksums.tsv" || { rollback_active_transaction; /bin/rm -f "$inventory"; return 1; }
+    emit_progress "Cataloging backup" 100 "Payload manifest complete"
     {
         printf 'format=1\nstatus=complete\ncreated_at=%s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'bundle_id=%s\napp_name=%s\napp_version=%s\noriginal_app_path=%s\n' "$(encode_field "$id")" "$(encode_field "$MIGRATION_APP_NAME")" "$(encode_field "$MIGRATION_APP_VERSION")" "$(encode_field "$app")"
@@ -305,10 +312,16 @@ create_app_migration_folder_backup() {
         encoded_source=$(encode_field "$source")
         printf '%s\t%s\t%s\t%s\n' "$category" "$(encode_field "$relative")" "$encoded_source" "$size"
     done < "$inventory" > "$stage/items.tsv"
+    emit_progress "Committing backup" 0 "Activating verified package"
     /bin/mv "$stage" "$final" || { APPOFFLOAD_ERROR="Could not commit the migration backup."; rollback_active_transaction; /bin/rm -f "$inventory"; return 1; }
     ACTIVE_STAGE=""; /bin/rm -rf "$workdir"; /bin/rm -f "$inventory"; release_lock; clear_active_transaction
     LAST_EXTERNAL_BYTES=$total; LAST_MIGRATION_BACKUP="$final"; LAST_MIGRATION_APP_NAME="$MIGRATION_APP_NAME"; LAST_MIGRATION_ITEM_COUNT=$count; LAST_MIGRATION_OFFLOADED_COUNT=$offloaded_count
-    emit_progress "Complete" 100 "$count items verified"
+    debug_log "migration-folder-backup.done package=$final items=$count bytes=$total"
+    if [ "${3:-}" = "embedded" ]; then
+        emit_progress "Finalizing network image" 95 "$count items verified; preparing to detach"
+    else
+        emit_progress "Complete" 100 "$count items verified"
+    fi
 }
 
 migration_filesystem_personality() {
@@ -339,20 +352,24 @@ migration_target_kind() {
 
 migration_attach_sparsebundle() {
     local bundle="$1" readonly="${2:-0}" output mount
+    debug_log "sparsebundle.attach.begin bundle=$bundle readonly=$readonly"
     if [ "$readonly" = "1" ]; then
-        output=$("$HDIUTIL_BIN" attach -readonly -nobrowse -noautoopen "$bundle" 2>&1) || { APPOFFLOAD_ERROR="Could not mount network migration bundle: $output"; return 1; }
+        output=$("$HDIUTIL_BIN" attach -readonly -nobrowse -noautoopen "$bundle" 2>&1) || { debug_log "sparsebundle.attach.failed bundle=$bundle detail=$output"; APPOFFLOAD_ERROR="Could not mount network migration bundle: $output"; return 1; }
     else
-        output=$("$HDIUTIL_BIN" attach -nobrowse -noautoopen "$bundle" 2>&1) || { APPOFFLOAD_ERROR="Could not mount network migration bundle: $output"; return 1; }
+        output=$("$HDIUTIL_BIN" attach -nobrowse -noautoopen "$bundle" 2>&1) || { debug_log "sparsebundle.attach.failed bundle=$bundle detail=$output"; APPOFFLOAD_ERROR="Could not mount network migration bundle: $output"; return 1; }
     fi
     mount=$(printf '%s\n' "$output" | /usr/bin/awk -F '\t' '$NF ~ /^\// {value=$NF} END {print value}')
     [ -n "$mount" ] && [ -d "$mount" ] || { APPOFFLOAD_ERROR="The network migration image mounted without a readable mount point."; return 1; }
+    debug_log "sparsebundle.attach.done bundle=$bundle mount=$mount"
     printf '%s\n' "$mount"
 }
 
 migration_detach_sparsebundle() {
     local mount="$1" output
     [ -n "$mount" ] || return 0
-    output=$("$HDIUTIL_BIN" detach "$mount" 2>&1) || { APPOFFLOAD_ERROR="Migration data is safe, but its disk image could not be unmounted: $output"; return 1; }
+    debug_log "sparsebundle.detach.begin mount=$mount"
+    output=$("$HDIUTIL_BIN" detach "$mount" 2>&1) || { debug_log "sparsebundle.detach.failed mount=$mount detail=$output"; APPOFFLOAD_ERROR="Migration data is safe, but its disk image could not be unmounted: $output"; return 1; }
+    debug_log "sparsebundle.detach.done mount=$mount"
 }
 
 migration_network_bundle_safe() {
@@ -361,7 +378,8 @@ migration_network_bundle_safe() {
 
 create_app_migration_network_backup() {
     local app="$1" target="$2" inventory total free required capacity_mb timestamp safe_id safe_name root bundle sidecar volume_name mount
-    local saved_name saved_count saved_offloaded saved_bytes
+    local saved_name saved_count saved_offloaded saved_bytes create_output
+    debug_log "migration-network-backup.begin app=$app target=$target"
     APPOFFLOAD_ERROR=""; LAST_MIGRATION_BACKUP=""; LAST_MIGRATION_ITEM_COUNT=0; LAST_MIGRATION_OFFLOADED_COUNT=0
     migration_app_info "$app" || return 1
     [ -x "$HDIUTIL_BIN" ] || { APPOFFLOAD_ERROR="hdiutil is required for a network migration destination."; return 1; }
@@ -378,37 +396,44 @@ create_app_migration_network_backup() {
     /bin/mkdir -p "$root" || { APPOFFLOAD_ERROR="Could not create the network migration folder."; return 1; }
     [ ! -e "$bundle" ] && [ ! -e "$sidecar" ] || { APPOFFLOAD_ERROR="Network migration destination already exists."; return 1; }
     emit_progress "Preparing network backup" 2 "Creating APFS sparsebundle"
-    if ! "$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" >/dev/null 2>&1; then
+    debug_log "sparsebundle.create.begin bundle=$bundle capacity_mb=$capacity_mb"
+    if ! create_output=$("$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" 2>&1); then
+        debug_log "sparsebundle.create.failed bundle=$bundle detail=$create_output"
         APPOFFLOAD_ERROR="Could not create an APFS sparsebundle on the network share."
         return 1
     fi
+    debug_log "sparsebundle.create.done bundle=$bundle"
     migration_network_bundle_safe "$bundle" || { APPOFFLOAD_ERROR="Safety guard refused the network bundle path."; return 1; }
     ACTIVE_MIGRATION_NETWORK_BUNDLE="$bundle"
     mount=$(migration_attach_sparsebundle "$bundle" 0) || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
     ACTIVE_MIGRATION_MOUNT="$mount"
-    if ! create_app_migration_folder_backup "$app" "$mount"; then
+    if ! create_app_migration_folder_backup "$app" "$mount" embedded; then
         migration_detach_sparsebundle "$mount" >/dev/null 2>&1 || true
         ACTIVE_MIGRATION_MOUNT=""; /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""
         return 1
     fi
     saved_name="$LAST_MIGRATION_APP_NAME"; saved_count="$LAST_MIGRATION_ITEM_COUNT"; saved_offloaded="$LAST_MIGRATION_OFFLOADED_COUNT"; saved_bytes="$LAST_EXTERNAL_BYTES"
+    emit_progress "Finalizing network image" 96 "Flushing and unmounting APFS image"
     if ! migration_detach_sparsebundle "$mount"; then
         APPOFFLOAD_ERROR="Could not unmount the completed sparsebundle; it was retained at $bundle."
         ACTIVE_MIGRATION_MOUNT=""; ACTIVE_MIGRATION_NETWORK_BUNDLE=""
         return 1
     fi
     ACTIVE_MIGRATION_MOUNT=""
+    emit_progress "Finalizing network image" 99 "Writing backup catalog"
     {
         printf 'format=1\ntransport=sparsebundle\ncreated_at=%s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'app_name=%s\nbundle_id=%s\ntotal_bytes=%s\n' "$(encode_field "$saved_name")" "$(encode_field "$MIGRATION_BUNDLE_ID")" "$saved_bytes"
     } > "$sidecar" || { APPOFFLOAD_ERROR="The sparsebundle is complete, but its catalog metadata could not be written."; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
     ACTIVE_MIGRATION_NETWORK_BUNDLE=""
     LAST_MIGRATION_APP_NAME="$saved_name"; LAST_MIGRATION_ITEM_COUNT="$saved_count"; LAST_MIGRATION_OFFLOADED_COUNT="$saved_offloaded"; LAST_EXTERNAL_BYTES="$saved_bytes"; LAST_MIGRATION_BACKUP="$bundle"
+    debug_log "migration-network-backup.done bundle=$bundle items=$saved_count bytes=$saved_bytes"
     emit_progress "Complete" 100 "$saved_count items verified inside APFS sparsebundle"
 }
 
 create_app_migration_backup() {
     local app="$1" target="$2" kind
+    debug_log "migration-backup.begin app=$app target=$target"
     [ -d "$target" ] && [ -w "$target" ] || { APPOFFLOAD_ERROR="Target is not a mounted writable directory: $target"; return 1; }
     if [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" != "1" ]; then case "$target" in "$VOLUMES_ROOT"/*) ;; *) APPOFFLOAD_ERROR="Target must be mounted below $VOLUMES_ROOT"; return 1 ;; esac; fi
     kind=$(migration_target_kind "$target")
@@ -499,6 +524,7 @@ migration_read_package_info() {
 
 migration_copy_package_native() {
     local package="$1" target="$2" safe_id root final stage workdir copy_bytes free required
+    debug_log "migration-move-native.begin package=$package target=$target"
     safe_id=$(printf '%s' "$MIGRATION_PACKAGE_ID" | /usr/bin/tr -cd '[:alnum:]._-' ); root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
     final="$root/$(/usr/bin/basename "$package")"; stage="$root/.appoffload-staging-move-$$.appbackup"; workdir="${TMPDIR:-/tmp}/appoffload-migration-move-$$"
     [ ! -e "$final" ] || { APPOFFLOAD_ERROR="A migration backup with that name already exists on the target."; return 1; }
@@ -511,10 +537,12 @@ migration_copy_package_native() {
     /bin/mv "$stage" "$final" || { APPOFFLOAD_ERROR="Could not commit the moved backup."; rollback_active_transaction; return 1; }
     ACTIVE_STAGE=""; /bin/rm -rf "$workdir"; clear_active_transaction
     LAST_MIGRATION_BACKUP="$final"
+    debug_log "migration-move-native.done package=$final"
 }
 
 migration_copy_package_network() {
-    local package="$1" target="$2" safe_id safe_name timestamp root bundle sidecar volume_name capacity_mb mount image_root destination workdir copy_bytes free required
+    local package="$1" target="$2" safe_id safe_name timestamp root bundle sidecar volume_name capacity_mb mount image_root destination workdir copy_bytes free required create_output
+    debug_log "migration-move-network.begin package=$package target=$target"
     safe_id=$(printf '%s' "$MIGRATION_PACKAGE_ID" | /usr/bin/tr -cd '[:alnum:]._-' ); safe_name=$(printf '%s' "$MIGRATION_PACKAGE_NAME" | /usr/bin/tr '/:' '__')
     timestamp=$(/bin/date +%Y%m%d-%H%M%S); root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
     bundle="$root/$timestamp-$$-$safe_name.appmigration.sparsebundle"; sidecar="$bundle.appoffload.conf"; volume_name="AppMigration-$safe_id-$$"
@@ -523,7 +551,10 @@ migration_copy_package_network() {
     [ -n "$free" ] && [ "$free" -ge "$required" ] || { APPOFFLOAD_ERROR="Not enough network space for the backup move: need $(human_bytes "$required"), have $(human_bytes "${free:-0}")."; return 1; }
     capacity_mb=$(((copy_bytes + copy_bytes / 4 + 536870912 + 1048575) / 1048576)); [ "$capacity_mb" -lt 1024 ] && capacity_mb=1024
     /bin/mkdir -p "$root" || { APPOFFLOAD_ERROR="Could not create network backup folder."; return 1; }
-    if ! "$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" >/dev/null 2>&1; then APPOFFLOAD_ERROR="Could not create the destination sparsebundle."; return 1; fi
+    emit_progress "Preparing network image" 0 "Creating APFS sparsebundle"
+    debug_log "sparsebundle.create.begin bundle=$bundle capacity_mb=$capacity_mb"
+    if ! create_output=$("$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" 2>&1); then debug_log "sparsebundle.create.failed bundle=$bundle detail=$create_output"; APPOFFLOAD_ERROR="Could not create the destination sparsebundle."; return 1; fi
+    debug_log "sparsebundle.create.done bundle=$bundle"
     ACTIVE_MIGRATION_NETWORK_BUNDLE="$bundle"
     mount=$(migration_attach_sparsebundle "$bundle" 0) || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
     ACTIVE_MIGRATION_MOUNT="$mount"; image_root="$mount/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"; destination="$image_root/$(/usr/bin/basename "$package")"; workdir="${TMPDIR:-/tmp}/appoffload-migration-network-move-$$"
@@ -532,6 +563,7 @@ migration_copy_package_network() {
     copy_with_progress "$package" "$destination" "$copy_bytes" || { rollback_active_transaction; return 1; }
     migration_verify_pair "$package" "$destination" "$workdir" "network-backup-move" || { rollback_active_transaction; return 1; }
     /bin/rm -rf "$workdir"
+    emit_progress "Finalizing network image" 96 "Flushing and unmounting APFS image"
     if ! migration_detach_sparsebundle "$mount"; then
         APPOFFLOAD_ERROR="Could not unmount the completed sparsebundle; it was retained at $bundle."
         ACTIVE_MIGRATION_MOUNT=""; ACTIVE_MIGRATION_NETWORK_BUNDLE=""
@@ -539,11 +571,13 @@ migration_copy_package_network() {
         return 1
     fi
     ACTIVE_MIGRATION_MOUNT=""
+    emit_progress "Finalizing network image" 99 "Writing backup catalog"
     {
         printf 'format=1\ntransport=sparsebundle\ncreated_at=%s\n' "$MIGRATION_PACKAGE_CREATED"
         printf 'app_name=%s\nbundle_id=%s\ntotal_bytes=%s\n' "$(encode_field "$MIGRATION_PACKAGE_NAME")" "$(encode_field "$MIGRATION_PACKAGE_ID")" "$MIGRATION_PACKAGE_BYTES"
     } > "$sidecar" || { APPOFFLOAD_ERROR="The sparsebundle was created but could not be cataloged."; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
     ACTIVE_MIGRATION_NETWORK_BUNDLE=""; clear_active_transaction; LAST_MIGRATION_BACKUP="$bundle"
+    debug_log "migration-move-network.done bundle=$bundle"
 }
 
 migration_remove_backup_files() {
@@ -563,6 +597,7 @@ migration_remove_backup_files() {
 
 move_app_migration_backup() {
     local source="$1" target="$2" kind package result new_backup
+    debug_log "migration-move.begin source=$source target=$target"
     APPOFFLOAD_ERROR=""; LAST_MIGRATION_BACKUP=""; LAST_EXTERNAL_BYTES=0
     [ -d "$target" ] && [ -w "$target" ] || { APPOFFLOAD_ERROR="Target is not a mounted writable directory: $target"; return 1; }
     if [ "${APPOFFLOAD_ALLOW_ANY_TARGET:-0}" != "1" ]; then case "$target" in "$VOLUMES_ROOT"/*) ;; *) APPOFFLOAD_ERROR="Target must be mounted below $VOLUMES_ROOT"; return 1 ;; esac; fi
@@ -574,10 +609,13 @@ move_app_migration_backup() {
     new_backup="$LAST_MIGRATION_BACKUP"; migration_close_backup_source
     if ! migration_remove_backup_files "$source"; then release_lock; LAST_MIGRATION_BACKUP="$new_backup"; APPOFFLOAD_ERROR="The verified destination exists at $new_backup, but the original could not be removed."; return 1; fi
     release_lock; LAST_MIGRATION_BACKUP="$new_backup"; LAST_EXTERNAL_BYTES="$MIGRATION_PACKAGE_BYTES"; LAST_MIGRATION_APP_NAME="$MIGRATION_PACKAGE_NAME"
+    debug_log "migration-move.done source=$source destination=$new_backup"
+    emit_progress "Complete" 100 "Backup moved and source removed"
 }
 
 delete_app_migration_backup() {
     local source="$1" sidecar
+    debug_log "migration-delete.begin source=$source"
     APPOFFLOAD_ERROR=""; LAST_EXTERNAL_BYTES=0; LAST_MIGRATION_APP_NAME=""
     if migration_native_backup_safe "$source"; then
         [ -f "$source/metadata.conf" ] || { APPOFFLOAD_ERROR="Migration backup metadata is missing."; return 1; }
@@ -595,24 +633,30 @@ delete_app_migration_backup() {
     acquire_lock || return 1
     if ! migration_remove_backup_files "$source"; then release_lock; return 1; fi
     release_lock; LAST_EXTERNAL_BYTES="$MIGRATION_PACKAGE_BYTES"; LAST_MIGRATION_APP_NAME="$MIGRATION_PACKAGE_NAME"
+    debug_log "migration-delete.done source=$source bytes=$LAST_EXTERNAL_BYTES"
 }
 
 verify_app_migration_backup() {
     local backup="$1" expected actual workdir
+    debug_log "migration-verify-package.begin backup=$backup"
     APPOFFLOAD_ERROR=""
     [ -d "$backup/payload" ] && [ -f "$backup/metadata.conf" ] && [ -f "$backup/items.tsv" ] && [ -f "$backup/checksums.tsv" ] || { APPOFFLOAD_ERROR="Not a complete AppSupport Offload migration backup: $backup"; return 1; }
     [ "$(/usr/bin/awk -F= '$1 == "format" {print $2;exit}' "$backup/metadata.conf")" = "1" ] || { APPOFFLOAD_ERROR="Unsupported migration backup format."; return 1; }
     [ "$(/usr/bin/awk -F= '$1 == "status" {print $2;exit}' "$backup/metadata.conf")" = "complete" ] || { APPOFFLOAD_ERROR="Migration backup is not marked complete."; return 1; }
     workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-migration-verify.XXXXXX") || return 1
+    emit_progress "Verifying backup" 0 "Hashing complete payload"
     actual="$workdir/checksums.tsv"; create_manifest "$backup/payload" "$actual" || { /bin/rm -rf "$workdir"; return 1; }
     expected="$backup/checksums.tsv"
     if ! /usr/bin/cmp -s "$expected" "$actual"; then /bin/rm -rf "$workdir"; APPOFFLOAD_ERROR="Migration backup checksum verification failed."; return 1; fi
     /bin/rm -rf "$workdir"
+    debug_log "migration-verify-package.done backup=$backup"
+    emit_progress "Verifying backup" 100 "Checksums match"
 }
 
 restore_app_migration_backup() {
     local backup="$1" app_target_root="${2:-}" metadata items original_app app_name total free required stage workdir transaction_id
     local category encoded_relative encoded_source size relative target staged index=0 count committed_file actual_count
+    debug_log "migration-restore.begin backup=$backup target=${app_target_root:-default}"
     APPOFFLOAD_ERROR=""; LAST_LOCAL_DELTA_BYTES=0; LAST_EXTERNAL_BYTES=0; LAST_MIGRATION_APP_NAME=""; LAST_MIGRATION_ITEM_COUNT=0
     verify_app_migration_backup "$backup" || return 1
     metadata="$backup/metadata.conf"; items="$backup/items.tsv"
@@ -654,6 +698,7 @@ restore_app_migration_backup() {
     fi
     ACTIVE_MIGRATION_COMMITTED_FILE=""; ACTIVE_STAGE=""; /bin/rm -rf "$stage" "$workdir"; release_lock; clear_active_transaction
     LAST_LOCAL_DELTA_BYTES=$((0 - total)); LAST_EXTERNAL_BYTES=$total; LAST_MIGRATION_APP_NAME="$app_name"; LAST_MIGRATION_ITEM_COUNT=$count
+    debug_log "migration-restore.done backup=$backup items=$count local_bytes=$total"
     emit_progress "Complete" 100 "$count items restored"
 }
 

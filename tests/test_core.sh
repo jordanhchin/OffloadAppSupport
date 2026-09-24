@@ -24,6 +24,9 @@ mkdir -p "$APPOFFLOAD_APP_SUPPORT_ROOT" "$APPOFFLOAD_VOLUMES_ROOT/External" "$AP
 . "$ROOT/lib/migration.sh"
 
 ui_progress() { :; }
+APPOFFLOAD_DEBUG=1
+APPOFFLOAD_LOG_FILE="$TEST_ROOT/debug.log"
+debug_init || { echo "FAIL: $APPOFFLOAD_ERROR" >&2; exit 1; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
 assert_file() { [ -f "$1" ] || fail "expected file: $1"; }
 assert_dir() { [ -d "$1" ] && [ ! -L "$1" ] || fail "expected directory: $1"; }
@@ -526,4 +529,24 @@ if clean_health_staging "$TEST_ROOT/not-managed/.AppSupportOffload/user/Applicat
     fail "staging cleanup accepted a path outside the volume root"
 fi
 
-echo "PASS: transactions, migration, health repair, guards, audit, and persistent locations"
+for LOG_EVENT in 'offload.begin' 'restore.done' 'health-scan.begin' 'migration-network-backup.done' 'sparsebundle.detach.begin' 'progress phase=Finalizing network image' 'migration-move.done' 'migration-delete.done'; do
+    /usr/bin/grep -Fq "$LOG_EVENT" "$APPOFFLOAD_DEBUG_LOG" || fail "debug log omitted $LOG_EVENT"
+done
+/usr/bin/awk '
+    /progress phase=Finalizing network image/ {
+        split($0, parts, "percent="); split(parts[2], value, " ");
+        expected[++seen] = value[1]; if (seen == 3) exit
+    }
+    END {exit !(seen == 3 && expected[1] == 95 && expected[2] == 96 && expected[3] == 99)}
+' "$APPOFFLOAD_DEBUG_LOG" || fail "network backup finalization progress regressed"
+ROTATION_LOG="$TEST_ROOT/rotation.log"
+printf 'old log content\n' > "$ROTATION_LOG"
+debug_rotate_log "$ROTATION_LOG" 4 || fail "$APPOFFLOAD_ERROR"
+[ ! -e "$ROTATION_LOG" ] && assert_file "$ROTATION_LOG.1"
+CUSTOM_LOG="$TEST_ROOT/custom-existing.log"
+printf 'existing log\n' > "$CUSTOM_LOG"
+/bin/chmod 644 "$CUSTOM_LOG"
+APPOFFLOAD_LOG_FILE="$CUSTOM_LOG"
+debug_init || fail "$APPOFFLOAD_ERROR"
+[ "$(/usr/bin/stat -f %Lp "$CUSTOM_LOG")" = "644" ] || fail "debug init changed an existing custom log's permissions"
+echo "PASS: transactions, migration, health repair, guards, audit, persistent locations, and debug logging"

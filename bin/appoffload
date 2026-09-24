@@ -16,13 +16,14 @@ APPOFFLOAD_VERSION=$(/bin/cat "$PROJECT_DIR/VERSION" 2>/dev/null || echo "develo
 . "$PROJECT_DIR/lib/core.sh"
 # shellcheck source=../lib/migration.sh
 . "$PROJECT_DIR/lib/migration.sh"
-trap 'rollback_active_transaction; exit 130' INT TERM
+trap 'debug_log "signal received; rolling back operation=$ACTIVE_OPERATION phase=$ACTIVE_PHASE"; rollback_active_transaction; exit 130' INT TERM
+trap 'debug_log "session-end status=$? error=$APPOFFLOAD_ERROR"' EXIT
 
 usage() {
     printf 'AppSupport Offload %s — safely move ~/Library/Application Support folders\n\n' "$APPOFFLOAD_VERSION"
     cat <<'EOF'
 Usage:
-  appoffload                         Open the interactive TUI
+  appoffload [--debug]               Open the interactive TUI
   appoffload list                    List local and offloaded folders
   appoffload audit                   Compare installed apps and support folders
   appoffload locations               List installed-app search locations
@@ -49,6 +50,10 @@ Usage:
   appoffload restore NAME
   appoffload help
   appoffload version
+
+Prefix any command with --debug to write a timestamped diagnostic log to
+~/Library/Logs/AppSupportOffload/debug.log. Set APPOFFLOAD_LOG_FILE to use a
+different path, or APPOFFLOAD_DEBUG=1 to enable logging without the flag.
 
 Offloads are copied with macOS metadata, SHA-256 verified, and activated with
 a symbolic link only after verification. Running apps with open files in the
@@ -79,7 +84,11 @@ print_external_summary() {
     printf 'External data affected: %s\nLocal disk usage unchanged.\n' "$(human_bytes "$bytes")"
 }
 
+if [ "${1:-}" = "--debug" ]; then APPOFFLOAD_DEBUG=1; shift; fi
+debug_init || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
 command_name="${1:-tui}"
+debug_log "command.begin name=$command_name arguments=$#"
+if [ -n "$APPOFFLOAD_DEBUG_LOG" ]; then printf 'Debug log: %s\n' "$APPOFFLOAD_DEBUG_LOG" >&2; fi
 case "$command_name" in
     tui)
         if [ ! -t 0 ] || [ ! -t 1 ]; then echo "The TUI requires an interactive terminal." >&2; exit 2; fi

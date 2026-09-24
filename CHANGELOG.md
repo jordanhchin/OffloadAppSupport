@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-09-24
+
+- Add opt-in, timestamped debug logging for TUI and CLI sessions, including
+  offload and restore transactions, health actions, app migration, verification,
+  backup management, journal phases, and sparsebundle mount/unmount work.
+- Show explicit hashing, cataloging, and network-image finalization phases.
+  A network backup now reports Complete only after its image is detached and
+  its catalog sidecar has been written.
+- Keep native `.appbackup` and network sparsebundle formats supported; no
+  backup format is deprecated.
+- Keep final network-image progress monotonic, rotate the default debug log at
+  10 MiB, and preserve permissions on an existing custom log file.
+
 ## 0.4.4 — 2026-09-24
 
 - Record the verified local staging directory's filesystem identity before a

@@ -1,6 +1,6 @@
 # AppSupport Offload
 
-Current release: **0.4.0**
+Current release: **0.5.0**
 
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
@@ -40,6 +40,7 @@ scriptable CLI with a polished terminal interface.
   percent consumed for the local disk and mounted volumes
 - Exit summary listing every action and the net local-space change
 - Equivalent noninteractive commands for scripting
+- Opt-in timestamped debug log covering major workflows and long-running stages
 
 ## Run it
 
@@ -88,6 +89,23 @@ appoffload app verify "/Volumes/External SSD/.AppSupportOffload/App Backups/...a
 appoffload app restore "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload restore "Claude"
 ```
+
+For diagnostics, prefix either the TUI or any CLI command with `--debug`:
+
+```bash
+appoffload --debug
+appoffload --debug app backup "Example App" --target "/Volumes/Backup"
+tail -f "$HOME/Library/Logs/AppSupportOffload/debug.log"
+```
+
+The log records timestamps, operation and transaction phases, paths, progress,
+verification, and sparsebundle creation/mount/unmount events. It does not log
+file contents or a per-file trace. Set `APPOFFLOAD_LOG_FILE` to choose another
+path, or `APPOFFLOAD_DEBUG=1` to enable the mode without the flag. Debug logging
+is off by default. The default log rotates at 10 MiB, retaining one `.1`
+archive. A custom log path is not rotated; if its file already exists, its
+permissions are left unchanged. Logs contain local app paths, so review them
+before sharing.
 
 ### Complete-app migration
 

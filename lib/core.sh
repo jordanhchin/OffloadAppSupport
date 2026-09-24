@@ -12,6 +12,7 @@ PREFERENCES_ROOT="${APPOFFLOAD_PREFERENCES_ROOT:-$HOME/Library/Preferences}"
 SAVED_STATE_ROOT="${APPOFFLOAD_SAVED_STATE_ROOT:-$HOME/Library/Saved Application State}"
 MANAGED_DIR_NAME=".AppSupportOffload"
 APPOFFLOAD_ERROR=""
+APPOFFLOAD_DEBUG_LOG=""
 LAST_LOCAL_DELTA_BYTES=0
 LAST_EXTERNAL_BYTES=0
 LAST_APP_ROOT=""
@@ -36,12 +37,51 @@ REGISTRY_RELATIVE_PATH=""
 
 emit_progress() {
     local phase="$1" percent="$2" detail="${3:-}"
+    debug_log "progress phase=$phase percent=$percent detail=$detail"
     if type ui_progress >/dev/null 2>&1; then
         ui_progress "$phase" "$percent" "$detail"
     elif [ -t 1 ]; then
         printf '\r%-24s [%3s%%] %-36s' "$phase" "$percent" "$detail"
         [ "$percent" = "100" ] && printf '\n'
     fi
+}
+
+debug_init() {
+    local directory custom_log=0 existed=0
+    [ "${APPOFFLOAD_DEBUG:-0}" = "1" ] || return 0
+    [ -z "${APPOFFLOAD_LOG_FILE:-}" ] || custom_log=1
+    APPOFFLOAD_DEBUG_LOG="${APPOFFLOAD_LOG_FILE:-$HOME/Library/Logs/AppSupportOffload/debug.log}"
+    directory=$(/usr/bin/dirname "$APPOFFLOAD_DEBUG_LOG")
+    [ ! -L "$APPOFFLOAD_DEBUG_LOG" ] || { APPOFFLOAD_ERROR="Debug log path is a symbolic link: $APPOFFLOAD_DEBUG_LOG"; return 1; }
+    (umask 077; /bin/mkdir -p "$directory") || { APPOFFLOAD_ERROR="Could not create debug log directory: $directory"; return 1; }
+    [ ! -e "$APPOFFLOAD_DEBUG_LOG" ] || [ -f "$APPOFFLOAD_DEBUG_LOG" ] || { APPOFFLOAD_ERROR="Debug log path is not a file: $APPOFFLOAD_DEBUG_LOG"; return 1; }
+    [ ! -f "$APPOFFLOAD_DEBUG_LOG" ] || existed=1
+    if [ "$custom_log" -eq 0 ]; then
+        [ "$existed" -eq 0 ] || /bin/chmod 600 "$APPOFFLOAD_DEBUG_LOG" || { APPOFFLOAD_ERROR="Could not restrict debug log permissions: $APPOFFLOAD_DEBUG_LOG"; return 1; }
+        debug_rotate_log "$APPOFFLOAD_DEBUG_LOG" || return 1
+    fi
+    (umask 077; printf '%s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$ session-start version=${APPOFFLOAD_VERSION:-unknown}" >> "$APPOFFLOAD_DEBUG_LOG") || { APPOFFLOAD_ERROR="Could not write debug log: $APPOFFLOAD_DEBUG_LOG"; return 1; }
+    if [ "$custom_log" -eq 0 ] || [ "$existed" -eq 0 ]; then
+        /bin/chmod 600 "$APPOFFLOAD_DEBUG_LOG" || { APPOFFLOAD_ERROR="Could not restrict debug log permissions: $APPOFFLOAD_DEBUG_LOG"; return 1; }
+    fi
+}
+
+debug_rotate_log() {
+    local file="$1" threshold="${2:-10485760}" bytes archive="${1}.1"
+    [ -f "$file" ] || return 0
+    bytes=$(/usr/bin/wc -c < "$file" 2>/dev/null) || { APPOFFLOAD_ERROR="Could not measure debug log: $file"; return 1; }
+    [ "$bytes" -lt "$threshold" ] && return 0
+    [ ! -e "$archive" ] || [ -f "$archive" ] || { APPOFFLOAD_ERROR="Debug log archive path is not a file: $archive"; return 1; }
+    [ ! -L "$archive" ] || { APPOFFLOAD_ERROR="Debug log archive path is a symbolic link: $archive"; return 1; }
+    /bin/mv -f "$file" "$archive" || { APPOFFLOAD_ERROR="Could not rotate debug log: $file"; return 1; }
+}
+
+debug_log() {
+    [ -n "$APPOFFLOAD_DEBUG_LOG" ] || return 0
+    local message="$1"
+    message=${message//$'\n'/ }
+    message=${message//$'\r'/ }
+    printf '%s pid=%s %s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$message" >> "$APPOFFLOAD_DEBUG_LOG" 2>/dev/null || true
 }
 
 new_transaction_id() {
@@ -310,6 +350,7 @@ list_app_roots() {
 }
 
 add_app_root() {
+    debug_log "app-root.add path=$1"
     local requested="$1" root temp existing
     APPOFFLOAD_ERROR=""
     LAST_APP_ROOT=""
@@ -338,6 +379,7 @@ add_app_root() {
 }
 
 remove_app_root() {
+    debug_log "app-root.remove path=$1"
     local requested="$1" root temp found=0 item
     APPOFFLOAD_ERROR=""
     root="$requested"
@@ -397,6 +439,7 @@ folder_has_uninstall_evidence() {
 # "recommend" is intentionally conservative: it requires a reverse-domain-style
 # folder name, no installed bundle-ID match, and a surviving preference/state file.
 audit_folders() {
+    debug_log "audit.begin"
     local workdir index size location path name id_key name_key match related classification evidence
     workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-audit.XXXXXX") || return 1
     index="$workdir/apps.tsv"
@@ -459,6 +502,7 @@ same_destination() {
 }
 
 health_scan() {
+    debug_log "health-scan.begin"
     local a b c d e recorded source destination identity volume_root relative name current mounted candidate detail
     local volume stage journal phase backup base rest recovered_source user_name managed_root candidate bundle
     sync_offload_registry
@@ -550,6 +594,7 @@ health_scan() {
 }
 
 repair_offload_link() {
+    debug_log "health-repair-link.begin source=$1"
     local source="$1" mounted candidate name temporary_link
     APPOFFLOAD_ERROR=""
     lookup_offload_record "$source" || { APPOFFLOAD_ERROR="No health record exists for: $source"; return 1; }
@@ -606,6 +651,7 @@ is_health_journal_path() {
 }
 
 clean_health_staging() {
+    debug_log "health-clean-staging.begin path=$1"
     local stage="$1"
     APPOFFLOAD_ERROR=""
     { is_health_staging_path "$stage" || is_restore_staging_path "$stage"; } || { APPOFFLOAD_ERROR="Safety guard refused unexpected staging path: $stage"; return 1; }
@@ -615,6 +661,7 @@ clean_health_staging() {
 }
 
 recover_local_backup() {
+    debug_log "health-recover-local.begin path=$1"
     local backup="$1" base rest name source
     APPOFFLOAD_ERROR=""
     case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) ;; *) APPOFFLOAD_ERROR="Safety guard refused unexpected backup path."; return 1 ;; esac
@@ -625,6 +672,7 @@ recover_local_backup() {
 }
 
 recover_incomplete_transaction() {
+    debug_log "health-recover-transaction.begin journal=$1"
     local journal="$1" phase encoded source backup stage stage_identity final old_destination operation current="" workdir
     APPOFFLOAD_ERROR=""
     is_health_journal_path "$journal" || { APPOFFLOAD_ERROR="Safety guard refused unexpected transaction record."; return 1; }
@@ -770,6 +818,7 @@ sha256_file() {
 
 create_manifest() {
     local root="$1" output="$2" temp item relative encoded kind size digest target
+    debug_log "manifest.begin root=$root output=$output"
     temp="${output}.unsorted"
     : > "$temp" || return 1
 
@@ -796,9 +845,11 @@ create_manifest() {
 
     LC_ALL=C /usr/bin/sort "$temp" > "$output"
     /bin/rm -f "$temp"
+    debug_log "manifest.done root=$root output=$output"
 }
 
 verify_trees() {
+    debug_log "verify.begin source=$1 destination=$2"
     local source="$1" destination="$2" workdir="$3"
     local before="$workdir/source.manifest" after="$workdir/destination.manifest" final_source="$workdir/source-final.manifest"
     emit_progress "Checksumming source" 0 "Building SHA-256 manifest"
@@ -816,12 +867,14 @@ verify_trees() {
         APPOFFLOAD_ERROR="The source changed during verification; quit the app and retry."
         return 1
     fi
+    debug_log "verify.done source=$source destination=$destination"
     emit_progress "Verifying copy" 100 "Every file matches"
 }
 
 copy_with_progress() {
     local source="$1" destination="$2" total="$3" pid copied percent status
     local ditto_bin="${APPOFFLOAD_DITTO:-/usr/bin/ditto}"
+    debug_log "copy.begin source=$source destination=$destination expected_bytes=$total"
     "$ditto_bin" --rsrc --extattr --acl "$source" "$destination" &
     pid=$!
     ACTIVE_COPY_PID=$pid
@@ -840,10 +893,12 @@ copy_with_progress() {
     status=$?
     ACTIVE_COPY_PID=""
     [ "$status" -eq 0 ] || {
+        debug_log "copy.failed destination=$destination exit=$status"
         APPOFFLOAD_ERROR="ditto could not copy the folder (exit $status)."
         return "$status"
     }
     emit_progress "Copying" 100 "$(human_bytes "$total") copied"
+    debug_log "copy.done destination=$destination"
 }
 
 filesystem_personality() {
@@ -863,9 +918,11 @@ ensure_compatible_filesystem() {
 }
 
 acquire_lock() {
+    debug_log "lock.acquire.begin"
     LOCK_DIR="$APP_SUPPORT_ROOT/.appoffload.lock"
     if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
         printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        debug_log "lock.acquire.done path=$LOCK_DIR"
         return 0
     fi
     local old_pid=""
@@ -877,15 +934,18 @@ acquire_lock() {
     /bin/rm -rf "$LOCK_DIR"
     /bin/mkdir "$LOCK_DIR" 2>/dev/null || { APPOFFLOAD_ERROR="Could not acquire the operation lock; another process may have taken it."; return 1; }
     printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    debug_log "lock.acquire.done path=$LOCK_DIR stale_lock_replaced=1"
 }
 
 release_lock() {
+    debug_log "lock.release path=$LOCK_DIR"
     [ -n "$LOCK_DIR" ] && [ "$LOCK_DIR" != "/" ] && /bin/rm -rf "$LOCK_DIR"
     LOCK_DIR=""
 }
 
 write_journal() {
     local file="$1" phase="$2" temp="${1}.pending-$$"
+    debug_log "journal.write operation=$ACTIVE_OPERATION phase=$phase path=$file"
     {
         printf 'version=1\nphase=%s\n' "$phase"
         printf 'source=%s\n' "$(encode_field "$ACTIVE_SOURCE")"
@@ -923,6 +983,7 @@ clear_active_transaction() {
 
 rollback_active_transaction() {
     local clean=1 current=""
+    debug_log "rollback.begin operation=$ACTIVE_OPERATION phase=$ACTIVE_PHASE source=$ACTIVE_SOURCE"
     if [ -n "$ACTIVE_COPY_PID" ] && /bin/kill -0 "$ACTIVE_COPY_PID" 2>/dev/null; then
         /bin/kill -TERM "$ACTIVE_COPY_PID" 2>/dev/null || true
         wait "$ACTIVE_COPY_PID" 2>/dev/null || true
@@ -997,6 +1058,7 @@ rollback_active_transaction() {
 offload_folder() {
     local source="$1" target="$2" name user_name managed_root transaction_root transaction_id
     local final stage backup workdir journal total free required copy_verified=0
+    debug_log "offload.begin source=$source target=$target"
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -1109,11 +1171,13 @@ offload_folder() {
     clear_active_transaction
     LAST_LOCAL_DELTA_BYTES=$total
     LAST_EXTERNAL_BYTES=$total
+    debug_log "offload.done source=$source destination=$final reclaimed_bytes=$total"
     [ "$copy_verified" -eq 1 ]
 }
 
 restore_folder() {
     local source="$1" destination name transaction_id staging workdir journal total free required
+    debug_log "restore.begin source=$source"
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -1178,6 +1242,7 @@ restore_folder() {
     clear_active_transaction
     LAST_LOCAL_DELTA_BYTES=$((0 - total))
     LAST_EXTERNAL_BYTES=$total
+    debug_log "restore.done source=$source consumed_bytes=$total"
     emit_progress "Complete" 100 "External copy removed"
 }
 
@@ -1193,6 +1258,7 @@ safe_remove_managed_destination() {
 move_offload() {
     local source="$1" target="$2" old_destination name user_name managed_root transaction_root transaction_id
     local final stage temporary_link workdir journal total free required
+    debug_log "offload-move.begin source=$source target=$target"
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -1286,11 +1352,13 @@ move_offload() {
     release_lock
     clear_active_transaction
     LAST_EXTERNAL_BYTES=$total
+    debug_log "offload-move.done source=$source destination=$final bytes=$total"
     emit_progress "Complete" 100 "Old external copy removed"
 }
 
 delete_offload() {
     local source="$1" destination name transaction_id link_backup total journal
+    debug_log "offload-delete.begin source=$source"
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -1335,5 +1403,6 @@ delete_offload() {
     release_lock
     clear_active_transaction
     LAST_EXTERNAL_BYTES=$total
+    debug_log "offload-delete.done source=$source destination=$destination bytes=$total"
     emit_progress "Deleting offload" 100 "External data permanently removed"
 }
