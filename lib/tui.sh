@@ -639,37 +639,90 @@ tui_create_app_migration() {
 }
 
 tui_restore_app_migration() {
-    local backup
-    load_migration_backup_menu
-    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
-    menu_select "Choose a complete-app backup to restore" "↑/↓ navigate  •  Enter select  •  q back" || return
-    backup="$SELECTED_VALUE"
+    local backup="${1:-}"
+    if [ -z "$backup" ]; then
+        load_migration_backup_menu
+        if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
+        menu_select "Choose a complete-app backup to restore" "↑/↓ navigate  •  Enter select  •  q back" || return
+        backup="$SELECTED_VALUE"
+    fi
     confirm_action "Confirm complete-app restore" "Verify and restore this app plus all discovered user Library data?" "Existing files are never overwritten; the backup remains on the removable disk." || return
-    if restore_app_migration_backup "$backup" ""; then
+    if restore_app_migration_source "$backup" ""; then
         record_action "Restored migration backup for" "$LAST_MIGRATION_APP_NAME" "$LAST_LOCAL_DELTA_BYTES"
         show_result 1 "$LAST_MIGRATION_APP_NAME and $LAST_MIGRATION_ITEM_COUNT items were restored."
     else show_result 0 "$APPOFFLOAD_ERROR"; fi
 }
 
 tui_verify_app_migration() {
-    local backup
-    load_migration_backup_menu
-    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
-    menu_select "Choose a complete-app backup to verify" "↑/↓ navigate  •  Enter verify  •  q back" || return
-    backup="$SELECTED_VALUE"
+    local backup="${1:-}"
+    if [ -z "$backup" ]; then
+        load_migration_backup_menu
+        if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
+        menu_select "Choose a complete-app backup to verify" "↑/↓ navigate  •  Enter verify  •  q back" || return
+        backup="$SELECTED_VALUE"
+    fi
     draw_header "Verifying complete-app backup"
     printf '\n  %sRecomputing SHA-256 checksums for the entire portable package…%s\n' "$C_CYAN" "$C_RESET"
-    if verify_app_migration_backup "$backup"; then show_result 1 "Every item in the migration backup matches its manifest."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+    if verify_app_migration_source "$backup"; then show_result 1 "Every item in the migration backup matches its manifest."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_move_app_migration() {
+    local backup="$1" target name
+    name=$(/usr/bin/basename "$backup")
+    load_volume_menu "$backup"
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No other writable destination is mounted."; return; fi
+    menu_select "Move migration backup" "↑/↓ navigate  •  Enter select  •  q back" || return
+    target="$SELECTED_VALUE"
+    confirm_action "Confirm backup move" "Move $name to $(/usr/bin/basename "$target")?" "The original is removed only after the destination is fully verified." || return
+    if move_app_migration_backup "$backup" "$target"; then
+        SESSION_ACTIONS+=("Moved migration backup for $LAST_MIGRATION_APP_NAME — verified; local disk unchanged")
+        show_result 1 "Backup moved and verified at $LAST_MIGRATION_BACKUP"
+    else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+confirm_migration_backup_delete() {
+    local name="$1" response
+    draw_header "Permanently delete migration backup"
+    printf '\n  %sThis permanently deletes the migration backup for %s.%s\n' "$C_RED" "$name" "$C_RESET"
+    printf '  Installed apps and current Library data are not changed.\n\n'
+    printf '  Type %sDELETE%s to continue: ' "$C_BOLD" "$C_RESET"
+    printf '\033[?25h'; IFS= read -r response; printf '\033[?25l'
+    [ "$response" = "DELETE" ]
+}
+
+tui_delete_app_migration() {
+    local backup="$1" name
+    name=$(/usr/bin/basename "$backup")
+    confirm_migration_backup_delete "$name" || return
+    if delete_app_migration_backup "$backup"; then
+        SESSION_ACTIONS+=("Deleted migration backup for $LAST_MIGRATION_APP_NAME — $(human_bytes "$LAST_EXTERNAL_BYTES") removed externally")
+        show_result 1 "Migration backup permanently deleted."
+    else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_manage_app_migrations() {
+    local backup name action
+    while true; do
+        load_migration_backup_menu
+        if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
+        menu_select "Manage migration backups" "↑/↓ navigate  •  Enter manage  •  q back" || return
+        backup="$SELECTED_VALUE"; name=$(/usr/bin/basename "$backup")
+        MENU_LABELS=("Restore app and user Library data" "Move backup to another destination" "Verify backup integrity" "Permanently delete backup" "Back to backup list")
+        MENU_VALUES=("restore" "move" "verify" "delete" "back")
+        menu_select "Manage $(truncate_text "$name" 46)" "↑/↓ navigate  •  Enter select  •  q back" || continue
+        action="$SELECTED_VALUE"
+        case "$action" in restore) tui_restore_app_migration "$backup" ;; move) tui_move_app_migration "$backup" ;; verify) tui_verify_app_migration "$backup" ;; delete) tui_delete_app_migration "$backup" ;; back) continue ;; esac
+    done
 }
 
 tui_app_migration() {
     local action
     while true; do
-        MENU_LABELS=("Create a complete-app migration backup" "Restore a complete-app migration backup" "Verify a migration backup" "Back to main menu")
-        MENU_VALUES=("backup" "restore" "verify" "back")
+        MENU_LABELS=("Create a complete-app migration backup" "Manage existing migration backups" "Back to main menu")
+        MENU_VALUES=("backup" "manage" "back")
         menu_select "Complete-app migration" "↑/↓ navigate  •  Enter select  •  q back" || return
         action="$SELECTED_VALUE"
-        case "$action" in backup) tui_create_app_migration ;; restore) tui_restore_app_migration ;; verify) tui_verify_app_migration ;; back) return ;; esac
+        case "$action" in backup) tui_create_app_migration ;; manage) tui_manage_app_migrations ;; back) return ;; esac
     done
 }
 

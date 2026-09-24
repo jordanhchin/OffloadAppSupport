@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-09-24
+
+- Add first-class SMB and NFS destinations for complete-app migration backups.
+  Network backups use an APFS sparsebundle while native removable disks retain
+  the existing `.appbackup` folder format.
+- Keep network filesystems prohibited for live symlink offloads.
+- Add unified migration-backup management: verify, restore, move between native
+  and network destinations with format conversion, and permanently remove.
+- Verify every moved backup before removing its source and retain readable
+  sidecar catalog metadata beside network sparsebundles.
+
 ## 0.3.0 — 2026-09-24
 
 - Add portable, non-destructive complete-app migration backups for moving to a

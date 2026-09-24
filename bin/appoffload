@@ -42,6 +42,8 @@ Usage:
   appoffload app inspect APP
   appoffload app backup APP --target /Volumes/DISK
   appoffload app backups
+  appoffload app backups move BACKUP_PATH --target /Volumes/DISK
+  appoffload app backups delete BACKUP_PATH --yes
   appoffload app verify BACKUP_PATH
   appoffload app restore BACKUP_PATH [--app-target DIRECTORY]
   appoffload restore NAME
@@ -200,17 +202,31 @@ case "$command_name" in
                 else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
             backups)
-                [ "$#" -eq 2 ] || { usage >&2; exit 2; }
-                printf '%-30s %-34s %12s  %s\n' "APP" "BUNDLE ID" "SIZE" "CREATED"
-                while IFS=$'\t' read -r size name identifier created path; do printf '%-30s %-34s %12s  %s\n' "$(printf '%.30s' "$name")" "$(printf '%.34s' "$identifier")" "$(human_bytes "$size")" "$created"; printf '  %s\n' "$path"; done < <(list_app_migration_backups)
+                backups_action="${3:-list}"
+                case "$backups_action" in
+                    list)
+                        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+                        printf '%-30s %-34s %12s  %s\n' "APP" "BUNDLE ID" "SIZE" "CREATED"
+                        while IFS=$'\t' read -r size name identifier created path; do printf '%-30s %-34s %12s  %s\n' "$(printf '%.30s' "$name")" "$(printf '%.34s' "$identifier")" "$(human_bytes "$size")" "$created"; printf '  %s\n' "$path"; done < <(list_app_migration_backups)
+                        ;;
+                    move)
+                        [ "$#" -eq 6 ] && [ "$5" = "--target" ] || { usage >&2; exit 2; }
+                        if move_app_migration_backup "$4" "$6"; then printf 'Migration backup moved and verified: %s\n' "$LAST_MIGRATION_BACKUP"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                        ;;
+                    delete)
+                        [ "$#" -eq 5 ] && [ "$5" = "--yes" ] || { echo "Permanent deletion requires: appoffload app backups delete BACKUP_PATH --yes" >&2; exit 2; }
+                        if delete_app_migration_backup "$4"; then printf 'Migration backup permanently deleted: %s (%s)\n' "$LAST_MIGRATION_APP_NAME" "$(human_bytes "$LAST_EXTERNAL_BYTES")"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                        ;;
+                    *) usage >&2; exit 2 ;;
+                esac
                 ;;
             verify)
                 [ "$#" -eq 3 ] || { usage >&2; exit 2; }
-                if verify_app_migration_backup "$3"; then echo "Migration backup verified: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
+                if verify_app_migration_source "$3"; then echo "Migration backup verified: $3"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
             restore)
                 if [ "$#" -eq 3 ]; then app_target=""; elif [ "$#" -eq 5 ] && [ "$4" = "--app-target" ]; then app_target="$5"; else usage >&2; exit 2; fi
-                if restore_app_migration_backup "$3" "$app_target"; then
+                if restore_app_migration_source "$3" "$app_target"; then
                     printf '\nMigration restore complete: %s\nItems: %s\nLocal space consumed: %s\nThe migration backup was retained.\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_ITEM_COUNT" "$(human_bytes "$((0 - LAST_LOCAL_DELTA_BYTES))")"
                 else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;

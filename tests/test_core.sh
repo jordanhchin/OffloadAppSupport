@@ -197,9 +197,59 @@ assert_file "$NEW_LIBRARY/Preferences/com.example.Migrator.plist"
 assert_file "$NEW_LIBRARY/Containers/com.example.Migrator/container.db"
 if restore_app_migration_backup "$MIGRATION_BACKUP" "$NEW_APPS"; then fail "migration restore overwrote existing data"; fi
 assert_contains "$APPOFFLOAD_ERROR" "refused to overwrite"
+
+# SMB/NFS migration destinations use a sparsebundle transport. Exercise
+# creation, discovery, verification, conversion back to a native folder backup,
+# a move back to the network, and permanent removal with a deterministic hdiutil
+# stand-in (the real hdiutil is covered by macOS integration smoke checks).
+NETWORK_TARGET="$APPOFFLOAD_VOLUMES_ROOT/SMB Share"
+FAKE_HDIUTIL="$TEST_ROOT/fake-hdiutil"
+mkdir -p "$NETWORK_TARGET"
+printf 'smbfs\n' > "$NETWORK_TARGET/.appoffload-filesystem-personality"
+ORIGINAL_FILESYSTEM_PERSONALITY=$(declare -f filesystem_personality)
+filesystem_personality() { printf 'SMBFS\n'; }
+APPOFFLOAD_ALLOW_ANY_TARGET=0
+if ensure_compatible_filesystem "$NETWORK_TARGET"; then fail "live offload filesystem guard accepted SMBFS"; fi
+assert_contains "$APPOFFLOAD_ERROR" "Unsupported target filesystem"
+eval "$ORIGINAL_FILESYSTEM_PERSONALITY"
+APPOFFLOAD_ALLOW_ANY_TARGET=1
+cat > "$FAKE_HDIUTIL" <<'MOCK'
+#!/bin/bash
+command="$1"
+last=""
+for argument in "$@"; do last="$argument"; done
+case "$command" in
+    create) mkdir -p "$last/mount" ;;
+    attach) printf '/dev/disk-test\tApple_APFS\t%s\n' "$last/mount" ;;
+    detach) exit 0 ;;
+    *) exit 2 ;;
+esac
+MOCK
+chmod +x "$FAKE_HDIUTIL"
+HDIUTIL_BIN="$FAKE_HDIUTIL"
+create_app_migration_backup "$MIGRATION_APP" "$NETWORK_TARGET" || fail "$APPOFFLOAD_ERROR"
+NETWORK_BACKUP="$LAST_MIGRATION_BACKUP"
+case "$NETWORK_BACKUP" in *.appmigration.sparsebundle) ;; *) fail "network migration did not create a sparsebundle" ;; esac
+assert_file "$NETWORK_BACKUP.appoffload.conf"
+verify_app_migration_source "$NETWORK_BACKUP" || fail "$APPOFFLOAD_ERROR"
+list_app_migration_backups | /usr/bin/awk -F '\t' -v p="$NETWORK_BACKUP" '$5 == p {found=1} END {exit !found}' || fail "network migration was not listed"
+move_app_migration_backup "$NETWORK_BACKUP" "$TARGET" || fail "$APPOFFLOAD_ERROR"
+NATIVE_MOVED_BACKUP="$LAST_MIGRATION_BACKUP"
+case "$NATIVE_MOVED_BACKUP" in *.appbackup) ;; *) fail "network-to-native move did not extract the appbackup" ;; esac
+[ ! -e "$NETWORK_BACKUP" ] || fail "network source remained after verified move"
+verify_app_migration_source "$NATIVE_MOVED_BACKUP" || fail "$APPOFFLOAD_ERROR"
+move_app_migration_backup "$NATIVE_MOVED_BACKUP" "$NETWORK_TARGET" || fail "$APPOFFLOAD_ERROR"
+NETWORK_MOVED_BACKUP="$LAST_MIGRATION_BACKUP"
+case "$NETWORK_MOVED_BACKUP" in *.appmigration.sparsebundle) ;; *) fail "native-to-network move did not create a sparsebundle" ;; esac
+[ ! -e "$NATIVE_MOVED_BACKUP" ] || fail "native source remained after verified network move"
+delete_app_migration_backup "$NETWORK_MOVED_BACKUP" || fail "$APPOFFLOAD_ERROR"
+[ ! -e "$NETWORK_MOVED_BACKUP" ] && [ ! -e "$NETWORK_MOVED_BACKUP.appoffload.conf" ] || fail "network backup removal left managed files"
+
 printf 'tamper\n' >> "$MIGRATION_BACKUP/payload/Library/Application Support/com.example.Migrator/state.db"
 if verify_app_migration_backup "$MIGRATION_BACKUP"; then fail "migration verification accepted modified payload data"; fi
 assert_contains "$APPOFFLOAD_ERROR" "checksum verification failed"
+delete_app_migration_backup "$MIGRATION_BACKUP" || fail "corrupt migration backup could not be explicitly removed: $APPOFFLOAD_ERROR"
+[ ! -e "$MIGRATION_BACKUP" ] || fail "explicit removal retained the corrupt migration backup"
 USER_LIBRARY_ROOT="$APPOFFLOAD_USER_LIBRARY_ROOT"
 USER_APPLICATIONS_ROOT="$APPOFFLOAD_USER_APPLICATIONS_ROOT"
 

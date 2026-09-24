@@ -800,6 +800,9 @@ rollback_active_transaction() {
             "${TMPDIR:-/tmp}"/appoffload-*) /bin/rm -rf "$ACTIVE_WORKDIR" ;;
         esac
     fi
+    if type rollback_migration_mount >/dev/null 2>&1; then
+        rollback_migration_mount
+    fi
     release_lock
     clear_active_transaction
 }

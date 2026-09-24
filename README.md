@@ -1,6 +1,6 @@
 # AppSupport Offload
 
-Current release: **0.3.0**
+Current release: **0.4.0**
 
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
@@ -26,6 +26,8 @@ scriptable CLI with a polished terminal interface.
 - Portable complete-app migration backups containing an app bundle and its
   conservatively discovered user Library data—even when Application Support is
   already offloaded
+- APFS sparsebundle transport for migration backups stored on mounted SMB or
+  NFS shares, plus verified move and deletion management
 - Running-process protection using macOS `lsof`
 - APFS / Mac OS Extended filesystem guard
 - Metadata-preserving copies using macOS `ditto` (ACLs, xattrs, resource forks)
@@ -80,6 +82,8 @@ appoffload health repair "Claude"
 appoffload app inspect "/Applications/Claude.app"
 appoffload app backup "/Applications/Claude.app" --target "/Volumes/External SSD"
 appoffload app backups
+appoffload app backups move "/path/to/backup" --target "/Volumes/Other Disk"
+appoffload app backups delete "/path/to/backup" --yes
 appoffload app verify "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload app restore "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload restore "Claude"
@@ -89,10 +93,10 @@ appoffload restore "Claude"
 
 Choose **Back up or restore a complete app** to prepare an app for a new Mac.
 Unlike a live offload, a migration backup is deliberately non-destructive: the
-installed app and its current data remain unchanged. Backups are stored at:
+installed app and its current data remain unchanged. Backups are stored below:
 
 ```text
-/Volumes/<disk>/.AppSupportOffload/App Backups/<bundle-id>/<timestamp>.appbackup
+/Volumes/<mount>/.AppSupportOffload/App Backups/<bundle-id>/
 ```
 
 The scanner begins with the app's bundle identifier, display name, and signed
@@ -122,6 +126,36 @@ It refuses the entire restore if any target already exists, never overwrites a
 new Mac's data, and retains the removable-disk backup afterward. Apps originally
 installed in `/Applications` return there by default; other apps return to
 `~/Applications`. The CLI `--app-target` option can select another app folder.
+
+#### Native disks and network shares
+
+APFS and Mac OS Extended targets continue to use the original directory-based
+`.appbackup` package. That format is not deprecated and existing backups remain
+fully supported.
+
+Mounted SMB and NFS targets use an APFS sparsebundle whose name ends in
+`.appmigration.sparsebundle`. The same `.appbackup` package lives inside its
+APFS filesystem, so macOS ACLs, extended attributes, resource forks, and
+symlinks do not depend on the network server's file semantics. A small adjacent
+`.appoffload.conf` file lets the tool list the backup without mounting it.
+
+Both formats are stored below:
+
+```text
+/Volumes/<mount>/.AppSupportOffload/App Backups/<bundle-id>/
+```
+
+The TUI's **Manage existing migration backups** screen can restore, verify,
+move, or permanently delete either format. A move to SMB/NFS converts a native
+backup into a sparsebundle; a move back to APFS/HFS extracts the normal
+`.appbackup`. The source is removed only after the destination is read back and
+verified. Permanent deletion requires typing `DELETE` in the TUI or passing
+`--yes` to the CLI.
+
+Network support applies only to portable migration backups. Live Application
+Support offloads remain restricted to APFS or Mac OS Extended because an app's
+active database and state should not depend on SMB/NFS latency, locking, or
+connection availability.
 
 Discovery is intentionally conservative because macOS has no authoritative
 app-to-file ownership database. Review `appoffload app inspect APP` before the
