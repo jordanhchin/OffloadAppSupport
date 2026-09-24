@@ -135,6 +135,43 @@ migration_source_kind() {
     fi
 }
 
+# Fast index used by the app picker. Unlike list_folders, this only measures
+# managed links, so opening the migration screen does not du every local folder.
+list_managed_migration_offloads() {
+    local source destination size
+    [ -d "$APP_SUPPORT_ROOT" ] || return 0
+    for source in "$APP_SUPPORT_ROOT"/*; do
+        [ -L "$source" ] || continue
+        destination=$(managed_link_destination "$source" 2>/dev/null || true)
+        [ -d "$destination" ] || continue
+        size=$(path_bytes "$destination" 2>/dev/null || echo 0)
+        printf '%s\t%s\n' "$size" "$(/usr/bin/basename "$source")"
+    done
+}
+
+migration_offload_matches_app() {
+    local app_name="$1" bundle_id="$2" folder_name="$3" id_lower folder_lower name_key id_key folder_key
+    id_lower=$(printf '%s' "$bundle_id" | /usr/bin/tr '[:upper:]' '[:lower:]')
+    folder_lower=$(printf '%s' "$folder_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+    name_key=$(normalize_identity "$app_name"); id_key=$(normalize_identity "${bundle_id##*.}"); folder_key=$(normalize_identity "$folder_name")
+    [ "$folder_lower" = "$id_lower" ] && return 0
+    case "$folder_lower" in "$id_lower".*) return 0 ;; esac
+    [ -n "$name_key" ] && [ "$folder_key" = "$name_key" ] && return 0
+    [ "${#id_key}" -gt 3 ] && [ "$folder_key" = "$id_key" ] && return 0
+    return 1
+}
+
+# Prints: count<TAB>allocated bytes for managed offloads associated with an app.
+migration_offload_totals() {
+    local app_name="$1" bundle_id="$2" report="$3" size folder count=0 total=0
+    [ -f "$report" ] || { printf '0\t0\n'; return; }
+    while IFS=$'\t' read -r size folder; do
+        [ -n "$folder" ] || continue
+        if migration_offload_matches_app "$app_name" "$bundle_id" "$folder"; then count=$((count + 1)); total=$((total + size)); fi
+    done < "$report"
+    printf '%s\t%s\n' "$count" "$total"
+}
+
 # Output: allocated bytes, category (App or Library), relative restore path, source.
 app_migration_inventory() {
     local app="$1" id name candidate group label plist base relative leaf_key name_key id_key

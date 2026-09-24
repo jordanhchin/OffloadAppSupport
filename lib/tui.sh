@@ -595,13 +595,24 @@ tui_health_center() {
 }
 
 load_migratable_app_menu() {
-    local size name identifier path
+    local size name identifier path offload_count offload_bytes badge rank apps report augmented
     MENU_LABELS=() MENU_VALUES=()
+    apps=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-app-picker.XXXXXX") || return
+    report="${apps}.offloads"; augmented="${apps}.sorted"
+    : > "$report"; : > "$augmented"
+    list_migratable_apps > "$apps"; list_managed_migration_offloads > "$report"
     while IFS=$'\t' read -r size name identifier path; do
         [ -n "$path" ] || continue
-        MENU_LABELS+=("$(printf '%-30s %10s  %s' "$(truncate_text "$name" 30)" "$(human_bytes "$size")" "$identifier")")
+        IFS=$'\t' read -r offload_count offload_bytes <<< "$(migration_offload_totals "$name" "$identifier" "$report")"
+        if [ "$offload_count" -gt 0 ]; then rank=0; badge="OFFLOADED $(human_bytes "$offload_bytes")"; else rank=1; badge=""; fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rank" "$name" "$size" "$identifier" "$path" "$offload_count" "$offload_bytes" >> "$augmented"
+    done < "$apps"
+    while IFS=$'\t' read -r rank name size identifier path offload_count offload_bytes; do
+        if [ "$offload_count" -gt 0 ]; then badge="OFFLOADED $(human_bytes "$offload_bytes")"; else badge=""; fi
+        MENU_LABELS+=("$(printf '%-25s %9s app  %-19s %s' "$(truncate_text "$name" 25)" "$(human_bytes "$size")" "$badge" "$identifier")")
         MENU_VALUES+=("$path")
-    done < <(list_migratable_apps | /usr/bin/sort -t $'\t' -k2,2)
+    done < <(/usr/bin/sort -t $'\t' -k1,1n -k2,2f "$augmented")
+    /bin/rm -f "$apps" "$report" "$augmented"
 }
 
 load_migration_backup_menu() {
@@ -618,7 +629,7 @@ tui_create_app_migration() {
     local app target report count total name size category relative source offloaded=0
     load_migratable_app_menu
     if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No installed apps were found in the configured search locations."; return; fi
-    menu_select "Choose an app to back up for migration" "↑/↓ navigate  •  Enter scan  •  q back" || return
+    menu_select "Choose an app — managed offloads shown first" "↑/↓ navigate  •  Enter scan  •  q back" || return
     app="$SELECTED_VALUE"; name=$(/usr/bin/basename "$app" .app)
     report=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-migration-preview.XXXXXX") || return
     draw_header "Discovering data associated with $name"

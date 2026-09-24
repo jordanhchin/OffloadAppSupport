@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 — 2026-09-24
+
+- Show `OFFLOADED <size>` beside apps with managed Application Support data in
+  the migration-backup picker and sort those apps first.
+
 ## 0.4.0 — 2026-09-24
 
 - Add first-class SMB and NFS destinations for complete-app migration backups.

@@ -93,7 +93,10 @@ appoffload restore "Claude"
 
 Choose **Back up or restore a complete app** to prepare an app for a new Mac.
 Unlike a live offload, a migration backup is deliberately non-destructive: the
-installed app and its current data remain unchanged. Backups are stored below:
+installed app and its current data remain unchanged. In the app picker, apps
+with managed Application Support offloads are sorted first and labeled
+`OFFLOADED` with the amount of external data that will be materialized into the
+backup. Backups are stored below:
 
 ```text
 /Volumes/<mount>/.AppSupportOffload/App Backups/<bundle-id>/
