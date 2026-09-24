@@ -813,7 +813,12 @@ ensure_not_in_use() {
 }
 
 sha256_file() {
-    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+    local output digest
+    output=$(/usr/bin/shasum -a 256 < "$1") || return 1
+    digest=${output%% *}
+    case "$digest" in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#digest}" -eq 64 ] || return 1
+    printf '%s\n' "$digest"
 }
 
 create_manifest() {
@@ -833,7 +838,7 @@ create_manifest() {
         elif [ -f "$item" ]; then
             kind="F"
             size=$(/usr/bin/stat -f '%z' "$item") || return 1
-            digest=$(sha256_file "$item") || return 1
+            digest=$(sha256_file "$item") || { APPOFFLOAD_ERROR="Could not hash file: $item"; return 1; }
             printf '%s\t%s\t%s\t%s\n' "$encoded" "$kind" "$size" "$digest" >> "$temp"
         elif [ -d "$item" ]; then
             printf '%s\tD\t0\t-\n' "$encoded" >> "$temp"

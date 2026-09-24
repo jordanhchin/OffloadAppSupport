@@ -42,7 +42,10 @@ Usage:
   appoffload health recover-transaction PATH --yes
   appoffload app inspect APP
   appoffload app backup APP --target /Volumes/DISK
+  appoffload app batch --target /Volumes/DISK APP [APP...]
   appoffload app backups
+  appoffload app backups check BACKUP_PATH
+  appoffload app backups update BACKUP_PATH
   appoffload app backups move BACKUP_PATH --target /Volumes/DISK
   appoffload app backups delete BACKUP_PATH --yes
   appoffload app verify BACKUP_PATH
@@ -212,6 +215,26 @@ case "$command_name" in
                     printf '\nMigration backup complete: %s\nItems: %s (%s existing offload(s) materialized)\nData copied: %s\nBackup: %s\nLocal disk usage unchanged.\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_ITEM_COUNT" "$LAST_MIGRATION_OFFLOADED_COUNT" "$(human_bytes "$LAST_EXTERNAL_BYTES")" "$LAST_MIGRATION_BACKUP"
                 else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
+            batch)
+                [ "$#" -ge 5 ] && [ "$3" = "--target" ] || { usage >&2; exit 2; }
+                batch_target="$4"; shift 4; batch_ok=0; batch_failed=0
+                for requested_app in "$@"; do
+                    if ! resolve_migratable_app "$requested_app" >/dev/null; then
+                        printf 'FAILED %s: %s\n' "$requested_app" "$APPOFFLOAD_ERROR" >&2
+                        batch_failed=$((batch_failed + 1)); continue
+                    fi
+                    app_path=$RESOLVED_MIGRATABLE_APP
+                    if create_app_migration_backup "$app_path" "$batch_target"; then
+                        printf 'DONE %s: %s\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_BACKUP"
+                        batch_ok=$((batch_ok + 1))
+                    else
+                        printf 'FAILED %s: %s\n' "$requested_app" "$APPOFFLOAD_ERROR" >&2
+                        batch_failed=$((batch_failed + 1))
+                    fi
+                done
+                printf 'Batch complete: %d backed up, %d failed. Local disk usage unchanged.\n' "$batch_ok" "$batch_failed"
+                [ "$batch_failed" -eq 0 ] || exit 1
+                ;;
             backups)
                 backups_action="${3:-list}"
                 case "$backups_action" in
@@ -219,6 +242,21 @@ case "$command_name" in
                         [ "$#" -eq 2 ] || { usage >&2; exit 2; }
                         printf '%-30s %-34s %12s  %s\n' "APP" "BUNDLE ID" "SIZE" "CREATED"
                         while IFS=$'\t' read -r size name identifier created path; do printf '%-30s %-34s %12s  %s\n' "$(printf '%.30s' "$name")" "$(printf '%.34s' "$identifier")" "$(human_bytes "$size")" "$created"; printf '  %s\n' "$path"; done < <(list_app_migration_backups)
+                        ;;
+                    check)
+                        [ "$#" -eq 4 ] || { usage >&2; exit 2; }
+                        check_app_migration_freshness "$4"; check_status=$?
+                        case "$check_status" in
+                            0) printf 'CURRENT: %s\n' "$4" ;;
+                            2) printf 'STALE: %s\n' "$4"; exit 3 ;;
+                            *) echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1 ;;
+                        esac
+                        ;;
+                    update)
+                        [ "$#" -eq 4 ] || { usage >&2; exit 2; }
+                        if update_app_migration_backup "$4"; then
+                            if [ "$LAST_MIGRATION_UPDATED" -eq 1 ]; then printf 'New verified backup: %s\nPrevious backup retained: %s\n' "$LAST_MIGRATION_BACKUP" "$4"; else printf 'Already current; no new backup: %s\n' "$4"; fi
+                        else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                         ;;
                     move)
                         [ "$#" -eq 6 ] && [ "$5" = "--target" ] || { usage >&2; exit 2; }

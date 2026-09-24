@@ -17,8 +17,13 @@ SESSION_DELTA=0
 SESSION_ACTIONS=()
 MENU_LABELS=()
 MENU_VALUES=()
+SELECTED_VALUES=()
 DISK_STATUS_ITEMS=()
 DISK_STATUS_CACHE_TIME=0
+MIGRATION_APP_CACHE_READY=0
+MIGRATION_APP_CACHE_ROWS=()
+MIGRATION_BACKUP_CACHE_READY=0
+MIGRATION_BACKUP_CACHE_ROWS=()
 
 tui_cleanup() {
     printf '%s\033[?25h\033[?1049l' "$C_RESET"
@@ -194,6 +199,42 @@ menu_select() {
     done
 }
 
+menu_select_multiple() {
+    local title="$1" count=${#MENU_LABELS[@]} key i start end visible width height status_rows label mark selected_count=0
+    local selected=()
+    SELECTED_VALUES=(); CURSOR=0; SCROLL=0
+    [ "$count" -gt 0 ] || return 1
+    for ((i=0; i<count; i++)); do selected[$i]=0; done
+    while true; do
+        draw_header "$title"
+        width=$(terminal_width); height=$(terminal_height); status_rows=$(status_bar_rows)
+        visible=$((height - status_rows - 7)); [ "$visible" -lt 3 ] && visible=3
+        [ "$CURSOR" -lt "$SCROLL" ] && SCROLL=$CURSOR
+        [ "$CURSOR" -ge $((SCROLL + visible)) ] && SCROLL=$((CURSOR - visible + 1))
+        start=$SCROLL; end=$((start + visible)); [ "$end" -gt "$count" ] && end=$count
+        for ((i=start; i<end; i++)); do
+            label=${MENU_LABELS[$i]}; mark=" "
+            [ "${selected[$i]}" -eq 0 ] || mark="✓"
+            if [ "$i" -eq "$CURSOR" ]; then
+                printf '%s%s  › [%s] %s%s\n' "$C_BLUE" "$C_BOLD" "$mark" "$(truncate_text "$label" "$((width - 10))")" "$C_RESET"
+            else
+                printf '    [%s] %s\n' "$mark" "$(truncate_text "$label" "$((width - 10))")"
+            fi
+        done
+        for ((i=end; i<start+visible; i++)); do printf '\n'; done
+        printf '\n%s  Space select  •  a all/none  •  Enter run %d selected  •  q back%s\n' "$C_DIM" "$selected_count" "$C_RESET"
+        key=$(read_key)
+        case "$key" in
+            $'\033[A'|k) [ "$CURSOR" -gt 0 ] && CURSOR=$((CURSOR - 1)) ;;
+            $'\033[B'|j) [ "$CURSOR" -lt $((count - 1)) ] && CURSOR=$((CURSOR + 1)) ;;
+            ' ') if [ "${selected[$CURSOR]}" -eq 0 ]; then selected[$CURSOR]=1; selected_count=$((selected_count + 1)); else selected[$CURSOR]=0; selected_count=$((selected_count - 1)); fi ;;
+            a) if [ "$selected_count" -eq "$count" ]; then for ((i=0; i<count; i++)); do selected[$i]=0; done; selected_count=0; else for ((i=0; i<count; i++)); do selected[$i]=1; done; selected_count=$count; fi ;;
+            '') [ "$selected_count" -gt 0 ] || continue; for ((i=0; i<count; i++)); do [ "${selected[$i]}" -eq 0 ] || SELECTED_VALUES+=("${MENU_VALUES[$i]}"); done; return 0 ;;
+            q|$'\033') return 1 ;;
+        esac
+    done
+}
+
 confirm_action() {
     local title="$1" line1="$2" line2="$3" key
     while true; do
@@ -272,6 +313,7 @@ record_action() {
         SESSION_ACTIONS+=("$verb $name — $(human_bytes "$((0 - delta))") additionally consumed locally")
     fi
     debug_log "tui.action verb=$verb name=$name local_delta_bytes=$delta"
+    MIGRATION_APP_CACHE_READY=0
 }
 
 tui_offload() {
@@ -318,6 +360,7 @@ tui_move_offload_source() {
     confirm_action "Confirm offload move" "Move $name ($(human_bytes "$size")) to $(/usr/bin/basename "$target")?" "The old external copy is removed only after the new copy is SHA-256 verified and active." || return
     if move_offload "$source" "$target"; then
         SESSION_ACTIONS+=("Moved offload $name — $(human_bytes "$LAST_EXTERNAL_BYTES") transferred; local disk unchanged")
+        MIGRATION_APP_CACHE_READY=0
         show_result 1 "$name now uses $(/usr/bin/basename "$target")."
     else
         show_result 0 "$APPOFFLOAD_ERROR"
@@ -344,6 +387,7 @@ tui_delete_offload_source() {
     confirm_permanent_delete "$name" || return
     if delete_offload "$source"; then
         SESSION_ACTIONS+=("Deleted offload $name — $(human_bytes "$LAST_EXTERNAL_BYTES") removed externally; local disk unchanged")
+        MIGRATION_APP_CACHE_READY=0
         show_result 1 "$name and its managed link were permanently deleted."
     else
         show_result 0 "$APPOFFLOAD_ERROR"
@@ -479,6 +523,7 @@ tui_add_app_root() {
     printf '\033[?25l'
     [ -n "$path" ] || return
     if add_app_root "$path" >/dev/null; then
+        MIGRATION_APP_CACHE_READY=0
         show_result 1 "Added app search location: $LAST_APP_ROOT"
     else
         show_result 0 "$APPOFFLOAD_ERROR"
@@ -496,6 +541,7 @@ tui_remove_app_root() {
     path="$SELECTED_VALUE"
     confirm_action "Remove search location" "Stop scanning $path?" "No apps or files in that folder will be changed." || return
     if remove_app_root "$path"; then
+        MIGRATION_APP_CACHE_READY=0
         show_result 1 "Removed app search location: $path"
     else
         show_result 0 "$APPOFFLOAD_ERROR"
@@ -581,7 +627,7 @@ tui_health_center() {
         case "$action" in
             repair-link)
                 confirm_action "Repair managed link" "$detail" "Retarget the link to $destination? No app data will be copied or deleted." || continue
-                if repair_offload_link "$source"; then show_result 1 "Managed link repaired and registry updated."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
+                if repair_offload_link "$source"; then MIGRATION_APP_CACHE_READY=0; show_result 1 "Managed link repaired and registry updated."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
                 ;;
             forget-record)
                 confirm_action "Remove stale health record" "$detail" "The local folder and external data will not be changed." || continue
@@ -606,35 +652,69 @@ tui_health_center() {
     done
 }
 
-load_migratable_app_menu() {
-    local size name identifier path offload_count offload_bytes badge rank apps report augmented
-    MENU_LABELS=() MENU_VALUES=()
-    apps=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-app-picker.XXXXXX") || return
+migration_backup_cache_refresh() {
+    local row
+    [ "$MIGRATION_BACKUP_CACHE_READY" -eq 0 ] || return 0
+    MIGRATION_BACKUP_CACHE_ROWS=()
+    while IFS= read -r row; do [ -n "$row" ] && MIGRATION_BACKUP_CACHE_ROWS+=("$row"); done < <(list_app_migration_backups | /usr/bin/sort -t $'\t' -k4,4r)
+    MIGRATION_BACKUP_CACHE_READY=1
+    debug_log "tui.backup-cache.refresh count=${#MIGRATION_BACKUP_CACHE_ROWS[@]}"
+}
+
+migration_app_cache_refresh() {
+    local apps report augmented size name identifier path offload_count offload_bytes rank row
+    [ "$MIGRATION_APP_CACHE_READY" -eq 0 ] || return 0
+    apps=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/appoffload-app-picker.XXXXXX") || return 1
     report="${apps}.offloads"; augmented="${apps}.sorted"
     : > "$report"; : > "$augmented"
     list_migratable_apps > "$apps"; list_managed_migration_offloads > "$report"
     while IFS=$'\t' read -r size name identifier path; do
         [ -n "$path" ] || continue
         IFS=$'\t' read -r offload_count offload_bytes <<< "$(migration_offload_totals "$name" "$identifier" "$report")"
-        if [ "$offload_count" -gt 0 ]; then rank=0; badge="OFFLOADED $(human_bytes "$offload_bytes")"; else rank=1; badge=""; fi
+        if [ "$offload_count" -gt 0 ]; then rank=0; else rank=1; fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rank" "$name" "$size" "$identifier" "$path" "$offload_count" "$offload_bytes" >> "$augmented"
     done < "$apps"
-    while IFS=$'\t' read -r rank name size identifier path offload_count offload_bytes; do
-        if [ "$offload_count" -gt 0 ]; then badge="OFFLOADED $(human_bytes "$offload_bytes")"; else badge=""; fi
-        MENU_LABELS+=("$(printf '%-25s %9s app  %-19s %s' "$(truncate_text "$name" 25)" "$(human_bytes "$size")" "$badge" "$identifier")")
-        MENU_VALUES+=("$path")
-    done < <(/usr/bin/sort -t $'\t' -k1,1n -k2,2f "$augmented")
+    MIGRATION_APP_CACHE_ROWS=()
+    while IFS= read -r row; do [ -n "$row" ] && MIGRATION_APP_CACHE_ROWS+=("$row"); done < <(/usr/bin/sort -t $'\t' -k1,1n -k2,2f "$augmented")
     /bin/rm -f "$apps" "$report" "$augmented"
+    MIGRATION_APP_CACHE_READY=1
+    debug_log "tui.app-cache.refresh count=${#MIGRATION_APP_CACHE_ROWS[@]}"
+}
+
+load_migratable_app_menu() {
+    local row backup_row rank name size identifier path offload_count offload_bytes backup_count backup_id backup_size backup_name backup_created backup_path badge
+    MENU_LABELS=() MENU_VALUES=()
+    migration_app_cache_refresh || return 1
+    migration_backup_cache_refresh || return 1
+    [ "${#MIGRATION_APP_CACHE_ROWS[@]}" -gt 0 ] || return 0
+    for row in "${MIGRATION_APP_CACHE_ROWS[@]}"; do
+        IFS=$'\t' read -r rank name size identifier path offload_count offload_bytes <<< "$row"
+        backup_count=0
+        if [ "${#MIGRATION_BACKUP_CACHE_ROWS[@]}" -gt 0 ]; then
+            for backup_row in "${MIGRATION_BACKUP_CACHE_ROWS[@]}"; do
+                IFS=$'\t' read -r backup_size backup_name backup_id backup_created backup_path <<< "$backup_row"
+                [ "$backup_id" != "$identifier" ] || backup_count=$((backup_count + 1))
+            done
+        fi
+        if [ "$offload_count" -gt 0 ]; then badge="OFFLOADED $(human_bytes "$offload_bytes")"; else badge=""; fi
+        [ "$backup_count" -eq 0 ] || badge="$badge BACKUPS:$backup_count"
+        MENU_LABELS+=("$(printf '%-25s %9s app  %-26s %s' "$(truncate_text "$name" 25)" "$(human_bytes "$size")" "$badge" "$identifier")")
+        MENU_VALUES+=("$path")
+    done
 }
 
 load_migration_backup_menu() {
-    local size name identifier created path
+    local row size name identifier created path relative disk
     MENU_LABELS=() MENU_VALUES=()
-    while IFS=$'\t' read -r size name identifier created path; do
+    migration_backup_cache_refresh || return 1
+    [ "${#MIGRATION_BACKUP_CACHE_ROWS[@]}" -gt 0 ] || return 0
+    for row in "${MIGRATION_BACKUP_CACHE_ROWS[@]}"; do
+        IFS=$'\t' read -r size name identifier created path <<< "$row"
         [ -n "$path" ] || continue
-        MENU_LABELS+=("$(printf '%-28s %10s  %s' "$(truncate_text "$name" 28)" "$(human_bytes "$size")" "$created")")
+        relative=${path#"$VOLUMES_ROOT"/}; disk=${relative%%/*}
+        MENU_LABELS+=("$(printf '%-24s %9s  @ %-18s %s  %s' "$(truncate_text "$name" 24)" "$(human_bytes "$size")" "$(truncate_text "$disk" 18)" "$created" "$path")")
         MENU_VALUES+=("$path")
-    done < <(list_app_migration_backups | /usr/bin/sort -t $'\t' -k4,4r)
+    done
 }
 
 tui_create_app_migration() {
@@ -656,9 +736,80 @@ tui_create_app_migration() {
     target="$SELECTED_VALUE"
     confirm_action "Confirm complete-app backup" "$name: $count items, $(human_bytes "$total"); $offloaded offload(s) will be materialized" "Copy to $(/usr/bin/basename "$target") and keep all originals unchanged?" || return
     if create_app_migration_backup "$app" "$target"; then
+        MIGRATION_BACKUP_CACHE_READY=0
         SESSION_ACTIONS+=("Backed up $LAST_MIGRATION_APP_NAME for migration — $(human_bytes "$LAST_EXTERNAL_BYTES") copied; local disk unchanged")
         show_result 1 "$LAST_MIGRATION_APP_NAME and $LAST_MIGRATION_ITEM_COUNT items were verified."
     else show_result 0 "$APPOFFLOAD_ERROR"; fi
+}
+
+tui_batch_app_migrations() {
+    local app target succeeded=0 failed=0 name failure index=0
+    local apps=() results=()
+    load_migratable_app_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No installed apps were found in the configured search locations."; return; fi
+    menu_select_multiple "Select apps to back up" || return
+    apps=("${SELECTED_VALUES[@]}")
+    load_volume_menu
+    if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No writable external volumes are mounted."; return; fi
+    menu_select "Choose one destination for ${#apps[@]} backups" "↑/↓ navigate  •  Enter select  •  q back" || return
+    target="$SELECTED_VALUE"
+    confirm_action "Confirm batch backup" "Create ${#apps[@]} separate, verified backups on $(/usr/bin/basename "$target")?" "Existing backups and all installed app data are retained." || return
+    for app in "${apps[@]}"; do
+        index=$((index + 1))
+        name=$(/usr/bin/basename "$app" .app)
+        emit_progress "Batch backup" "$(((index - 1) * 100 / ${#apps[@]}))" "$index of ${#apps[@]}: $name"
+        debug_log "migration-batch.item.begin index=$index total=${#apps[@]} app=$app target=$target"
+        if create_app_migration_backup "$app" "$target"; then
+            MIGRATION_BACKUP_CACHE_READY=0
+            succeeded=$((succeeded + 1))
+            results+=("✓ $name → $LAST_MIGRATION_BACKUP")
+            SESSION_ACTIONS+=("Backed up $LAST_MIGRATION_APP_NAME for migration — $(human_bytes "$LAST_EXTERNAL_BYTES") copied; local disk unchanged")
+        else
+            failed=$((failed + 1)); failure="$APPOFFLOAD_ERROR"
+            results+=("✗ $name — $failure")
+        fi
+        emit_progress "Batch backup" "$((index * 100 / ${#apps[@]}))" "$index of ${#apps[@]} finished"
+    done
+    MENU_LABELS=("${results[@]}"); MENU_VALUES=("${results[@]}")
+    menu_select "Batch complete: $succeeded succeeded, $failed failed; local disk unchanged" "↑/↓ review  •  Enter/q close" || true
+}
+
+tui_show_migration_backup_location() {
+    local backup="$1" width line
+    width=$(( $(terminal_width) - 4 )); [ "$width" -lt 16 ] && width=16
+    draw_header "Migration backup location"
+    printf '\n  Full path:\n\n'
+    while IFS= read -r line; do printf '  %s\n' "$line"; done < <(printf '%s\n' "$backup" | /usr/bin/fold -w "$width")
+    printf '\n  %sPress any key to continue%s' "$C_DIM" "$C_RESET"
+    read_key >/dev/null
+}
+
+tui_check_migration_backup_freshness() {
+    local backup="$1" status
+    draw_header "Checking migration backup freshness"
+    printf '\n  %sVerifying backup and hashing current app data…%s\n' "$C_CYAN" "$C_RESET"
+    check_app_migration_freshness "$backup"; status=$?
+    case "$status" in
+        0) show_result 1 "Backup is current: installed app and Library data match." ;;
+        2) show_result 0 "Backup is intact but older than the current app or Library data." ;;
+        *) show_result 0 "$APPOFFLOAD_ERROR" ;;
+    esac
+}
+
+tui_update_migration_backup() {
+    local backup="$1"
+    confirm_action "Refresh migration backup" "Compare this backup with the installed app and its Library data?" "If stale, a new backup is created beside it; the old backup remains." || return
+    if update_app_migration_backup "$backup"; then
+        if [ "$LAST_MIGRATION_UPDATED" -eq 1 ]; then
+            MIGRATION_BACKUP_CACHE_READY=0
+            SESSION_ACTIONS+=("Refreshed migration backup for $LAST_MIGRATION_APP_NAME — new verified copy; local disk unchanged")
+            show_result 1 "New verified backup: $LAST_MIGRATION_BACKUP"
+        else
+            show_result 1 "Backup is already current; no new copy was made."
+        fi
+    else
+        show_result 0 "$APPOFFLOAD_ERROR"
+    fi
 }
 
 tui_restore_app_migration() {
@@ -698,6 +849,7 @@ tui_move_app_migration() {
     target="$SELECTED_VALUE"
     confirm_action "Confirm backup move" "Move $name to $(/usr/bin/basename "$target")?" "The original is removed only after the destination is fully verified." || return
     if move_app_migration_backup "$backup" "$target"; then
+        MIGRATION_BACKUP_CACHE_READY=0
         SESSION_ACTIONS+=("Moved migration backup for $LAST_MIGRATION_APP_NAME — verified; local disk unchanged")
         show_result 1 "Backup moved and verified at $LAST_MIGRATION_BACKUP"
     else show_result 0 "$APPOFFLOAD_ERROR"; fi
@@ -718,6 +870,7 @@ tui_delete_app_migration() {
     name=$(/usr/bin/basename "$backup")
     confirm_migration_backup_delete "$name" || return
     if delete_app_migration_backup "$backup"; then
+        MIGRATION_BACKUP_CACHE_READY=0
         SESSION_ACTIONS+=("Deleted migration backup for $LAST_MIGRATION_APP_NAME — $(human_bytes "$LAST_EXTERNAL_BYTES") removed externally")
         show_result 1 "Migration backup permanently deleted."
     else show_result 0 "$APPOFFLOAD_ERROR"; fi
@@ -730,22 +883,22 @@ tui_manage_app_migrations() {
         if [ "${#MENU_VALUES[@]}" -eq 0 ]; then show_result 0 "No complete-app migration backups were found on mounted disks."; return; fi
         menu_select "Manage migration backups" "↑/↓ navigate  •  Enter manage  •  q back" || return
         backup="$SELECTED_VALUE"; name=$(/usr/bin/basename "$backup")
-        MENU_LABELS=("Restore app and user Library data" "Move backup to another destination" "Verify backup integrity" "Permanently delete backup" "Back to backup list")
-        MENU_VALUES=("restore" "move" "verify" "delete" "back")
+        MENU_LABELS=("Show full backup location" "Check backup is up to date" "Update backup if stale (retain old copy)" "Restore app and user Library data" "Move backup to another destination" "Verify backup integrity" "Permanently delete backup" "Back to backup list")
+        MENU_VALUES=("location" "freshness" "update" "restore" "move" "verify" "delete" "back")
         menu_select "Manage $(truncate_text "$name" 46)" "↑/↓ navigate  •  Enter select  •  q back" || continue
         action="$SELECTED_VALUE"
-        case "$action" in restore) tui_restore_app_migration "$backup" ;; move) tui_move_app_migration "$backup" ;; verify) tui_verify_app_migration "$backup" ;; delete) tui_delete_app_migration "$backup" ;; back) continue ;; esac
+        case "$action" in location) tui_show_migration_backup_location "$backup" ;; freshness) tui_check_migration_backup_freshness "$backup" ;; update) tui_update_migration_backup "$backup" ;; restore) tui_restore_app_migration "$backup" ;; move) tui_move_app_migration "$backup" ;; verify) tui_verify_app_migration "$backup" ;; delete) tui_delete_app_migration "$backup" ;; back) continue ;; esac
     done
 }
 
 tui_app_migration() {
     local action
     while true; do
-        MENU_LABELS=("Create a complete-app migration backup" "Manage existing migration backups" "Back to main menu")
-        MENU_VALUES=("backup" "manage" "back")
+        MENU_LABELS=("Create a complete-app migration backup" "Back up several apps (multi-select)" "Manage existing migration backups" "Refresh installed-app and backup lists" "Back to main menu")
+        MENU_VALUES=("backup" "batch" "manage" "refresh" "back")
         menu_select "Complete-app migration" "↑/↓ navigate  •  Enter select  •  q back" || return
         action="$SELECTED_VALUE"
-        case "$action" in backup) tui_create_app_migration ;; manage) tui_manage_app_migrations ;; back) return ;; esac
+        case "$action" in backup) tui_create_app_migration ;; batch) tui_batch_app_migrations ;; manage) tui_manage_app_migrations ;; refresh) MIGRATION_APP_CACHE_READY=0; MIGRATION_BACKUP_CACHE_READY=0; show_result 1 "App and backup lists will be rescanned when next opened." ;; back) return ;; esac
     done
 }
 

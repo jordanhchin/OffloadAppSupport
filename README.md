@@ -1,6 +1,6 @@
 # AppSupport Offload
 
-Current release: **0.5.0**
+Current release: **0.6.0**
 
 A lightweight, terminal-native macOS tool for moving large folders out of
 `~/Library/Application Support` and onto an external disk. It keeps the path
@@ -26,6 +26,8 @@ scriptable CLI with a polished terminal interface.
 - Portable complete-app migration backups containing an app bundle and its
   conservatively discovered user Library data—even when Application Support is
   already offloaded
+- Existing-backup badges, on-demand freshness checks, safe refresh, and
+  multi-select batch backup for complete apps
 - APFS sparsebundle transport for migration backups stored on mounted SMB or
   NFS shares, plus verified move and deletion management
 - Running-process protection using macOS `lsof`
@@ -85,6 +87,9 @@ appoffload app backup "/Applications/Claude.app" --target "/Volumes/External SSD
 appoffload app backups
 appoffload app backups move "/path/to/backup" --target "/Volumes/Other Disk"
 appoffload app backups delete "/path/to/backup" --yes
+appoffload app backups check "/path/to/backup"
+appoffload app backups update "/path/to/backup"
+appoffload app batch --target "/Volumes/External SSD" "Example App" "Another App"
 appoffload app verify "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload app restore "/Volumes/External SSD/.AppSupportOffload/App Backups/...appbackup"
 appoffload restore "Claude"
@@ -172,6 +177,25 @@ backup into a sparsebundle; a move back to APFS/HFS extracts the normal
 `.appbackup`. The source is removed only after the destination is read back and
 verified. Permanent deletion requires typing `DELETE` in the TUI or passing
 `--yes` to the CLI.
+
+The backup list shows the destination disk; **Show full backup location** shows
+the complete path. The app picker marks apps with existing backups. **Check
+backup is up to date** verifies the backup's checksum manifest and hashes the
+currently installed app and its discovered Library items. The CLI `check`
+command exits `0` for current, `3` for stale, and `1` if validation cannot be
+completed. **Update backup if stale** creates a new verified package on the
+same destination and keeps the earlier backup; it makes no copy when already
+current. This is a content check, not a timestamp-only guess, and can take time
+for large apps or network images. The TUI's **Back up several apps** option
+uses Space to select apps, then makes one separate backup per app on the chosen
+disk, reporting each success or failure. The CLI `app batch` command does the
+same sequentially and returns nonzero if any app fails.
+The installed-app inventory and backup list are cached in memory for the TUI
+session, so reopening the picker does not remeasure every app. Backup actions
+refresh backup counts without rescanning installed apps. Choose **Refresh
+installed-app and backup lists** if apps or disks changed outside the tool.
+Freshness compares paths, file contents, and symlink targets; it does not detect
+changes limited to ACLs or extended attributes.
 
 Network support applies only to portable migration backups. Live Application
 Support offloads remain restricted to APFS or Mac OS Extended because an app's

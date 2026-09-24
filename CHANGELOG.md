@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 — 2026-09-24
+
+- Show the destination disk in migration-backup lists and offer the full
+  backup path in the TUI management screen.
+- Mark installed apps that already have migration backups in the app picker.
+- Check backup integrity and freshness against the current app and discovered
+  Library data; refresh stale backups as new verified packages while retaining
+  the prior backup.
+- Add multi-select batch backup in the TUI and a sequential CLI batch command.
+- Cache app discovery and backup listings for the TUI session, invalidate the
+  relevant cache after managed changes, and provide manual refresh.
+- Keep first-run TUI menus safe with empty app or backup lists on Bash 3.2,
+  and hash filenames containing backslashes or newlines correctly.
+
 ## 0.5.0 — 2026-09-24
 
 - Add opt-in, timestamped debug logging for TUI and CLI sessions, including

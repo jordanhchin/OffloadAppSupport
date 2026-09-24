@@ -15,6 +15,11 @@ ACTIVE_MIGRATION_MOUNT=""
 ACTIVE_MIGRATION_NETWORK_BUNDLE=""
 MIGRATION_OPEN_MOUNT=""
 MIGRATION_OPEN_PACKAGE=""
+MIGRATION_ATTACHED_MOUNT=""
+LAST_MIGRATION_FRESHNESS=""
+LAST_MIGRATION_CURRENT_APP=""
+LAST_MIGRATION_UPDATED=0
+MIGRATION_CURRENT_APP_RESOLVED=""
 
 migration_safe_relative() {
     local path="$1" part rest
@@ -285,10 +290,10 @@ create_app_migration_folder_backup() {
         ensure_not_in_use "$actual" || { /bin/rm -f "$inventory"; release_lock; return 1; }
     done < "$inventory"
 
-    id="$MIGRATION_BUNDLE_ID"; safe_id=$(printf '%s' "$id" | /usr/bin/tr -cd '[:alnum:]._-' ); timestamp=$(/bin/date +%Y%m%d-%H%M%S)
+    id="$MIGRATION_BUNDLE_ID"; safe_id=$(printf '%s' "$id" | /usr/bin/tr -cd '[:alnum:]._-' ); timestamp=$(new_transaction_id)
     root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
-    final="$root/$timestamp-$$-$(printf '%s' "$MIGRATION_APP_NAME" | /usr/bin/tr '/:' '__').appbackup"
-    stage="$root/.appoffload-staging-$timestamp-$$.appbackup"; payload="$stage/payload"; workdir="${TMPDIR:-/tmp}/appoffload-migration-$timestamp-$$"
+    final="$root/$timestamp-$(printf '%s' "$MIGRATION_APP_NAME" | /usr/bin/tr '/:' '__').appbackup"
+    stage="$root/.appoffload-staging-$timestamp.appbackup"; payload="$stage/payload"; workdir="${TMPDIR:-/tmp}/appoffload-migration-$timestamp"
     [ ! -e "$final" ] || { /bin/rm -f "$inventory"; release_lock; APPOFFLOAD_ERROR="Migration backup already exists: $final"; return 1; }
     /bin/mkdir -p "$payload/App" "$payload/Library" "$workdir" || { /bin/rm -f "$inventory"; release_lock; APPOFFLOAD_ERROR="Could not create migration staging folders."; return 1; }
     ACTIVE_SOURCE="$app" ACTIVE_STAGE="$stage" ACTIVE_WORKDIR="$workdir" ACTIVE_PHASE="migration-backup"
@@ -352,6 +357,7 @@ migration_target_kind() {
 
 migration_attach_sparsebundle() {
     local bundle="$1" readonly="${2:-0}" output mount
+    MIGRATION_ATTACHED_MOUNT=""
     debug_log "sparsebundle.attach.begin bundle=$bundle readonly=$readonly"
     if [ "$readonly" = "1" ]; then
         output=$("$HDIUTIL_BIN" attach -readonly -nobrowse -noautoopen "$bundle" 2>&1) || { debug_log "sparsebundle.attach.failed bundle=$bundle detail=$output"; APPOFFLOAD_ERROR="Could not mount network migration bundle: $output"; return 1; }
@@ -360,6 +366,7 @@ migration_attach_sparsebundle() {
     fi
     mount=$(printf '%s\n' "$output" | /usr/bin/awk -F '\t' '$NF ~ /^\// {value=$NF} END {print value}')
     [ -n "$mount" ] && [ -d "$mount" ] || { APPOFFLOAD_ERROR="The network migration image mounted without a readable mount point."; return 1; }
+    MIGRATION_ATTACHED_MOUNT="$mount"
     debug_log "sparsebundle.attach.done bundle=$bundle mount=$mount"
     printf '%s\n' "$mount"
 }
@@ -391,8 +398,8 @@ create_app_migration_network_backup() {
     capacity_mb=$(((total + total / 4 + 536870912 + 1048575) / 1048576))
     [ "$capacity_mb" -lt 1024 ] && capacity_mb=1024
     safe_id=$(printf '%s' "$MIGRATION_BUNDLE_ID" | /usr/bin/tr -cd '[:alnum:]._-' ); safe_name=$(printf '%s' "$MIGRATION_APP_NAME" | /usr/bin/tr '/:' '__')
-    timestamp=$(/bin/date +%Y%m%d-%H%M%S); root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
-    bundle="$root/$timestamp-$$-$safe_name.appmigration.sparsebundle"; sidecar="$bundle.appoffload.conf"; volume_name="AppMigration-$safe_id-$$"
+    timestamp=$(new_transaction_id); root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
+    bundle="$root/$timestamp-$safe_name.appmigration.sparsebundle"; sidecar="$bundle.appoffload.conf"; volume_name="AppMigration-$safe_id-$$"
     /bin/mkdir -p "$root" || { APPOFFLOAD_ERROR="Could not create the network migration folder."; return 1; }
     [ ! -e "$bundle" ] && [ ! -e "$sidecar" ] || { APPOFFLOAD_ERROR="Network migration destination already exists."; return 1; }
     emit_progress "Preparing network backup" 2 "Creating APFS sparsebundle"
@@ -405,7 +412,8 @@ create_app_migration_network_backup() {
     debug_log "sparsebundle.create.done bundle=$bundle"
     migration_network_bundle_safe "$bundle" || { APPOFFLOAD_ERROR="Safety guard refused the network bundle path."; return 1; }
     ACTIVE_MIGRATION_NETWORK_BUNDLE="$bundle"
-    mount=$(migration_attach_sparsebundle "$bundle" 0) || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
+    migration_attach_sparsebundle "$bundle" 0 >/dev/null || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
+    mount="$MIGRATION_ATTACHED_MOUNT"
     ACTIVE_MIGRATION_MOUNT="$mount"
     if ! create_app_migration_folder_backup "$app" "$mount" embedded; then
         migration_detach_sparsebundle "$mount" >/dev/null 2>&1 || true
@@ -468,13 +476,120 @@ list_app_migration_backups() {
     done
 }
 
+# Rebuild the package's payload manifest from live sources without copying them.
+# This deliberately uses the same SHA-256 entry format as checksums.tsv.
+migration_live_manifest() {
+    local app="$1" output="$2" workdir="$3" inventory entries size category relative source actual base parent kind digest child encoded
+    inventory="$workdir/live-items.tsv"; entries="$workdir/live-entries.tsv"
+    app_migration_inventory "$app" > "$inventory" || return 1
+    : > "$entries" || return 1
+    printf '%s\tD\t0\t-\n' "$(encode_field App)" "$(encode_field Library)" >> "$entries"
+    while IFS=$'\t' read -r size category relative source; do
+        [ -n "$source" ] || continue
+        base="$category/$relative"
+        parent=${base%/*}
+        while [ "$parent" != "$category" ]; do
+            printf '%s\tD\t0\t-\n' "$(encode_field "$parent")" >> "$entries"
+            parent=${parent%/*}
+        done
+        actual=$(migration_materialized_source "$source") || { APPOFFLOAD_ERROR="Live migration item is unavailable: $source"; return 1; }
+        if [ -L "$actual" ]; then
+            digest=$(encode_field "$(/usr/bin/readlink "$actual")") || return 1
+            printf '%s\tL\t0\t%s\n' "$(encode_field "$base")" "$digest" >> "$entries"
+        elif [ -f "$actual" ]; then
+            size=$(/usr/bin/stat -f '%z' "$actual") || return 1
+            digest=$(sha256_file "$actual") || { APPOFFLOAD_ERROR="Could not hash live file: $actual"; return 1; }
+            printf '%s\tF\t%s\t%s\n' "$(encode_field "$base")" "$size" "$digest" >> "$entries"
+        elif [ -d "$actual" ]; then
+            printf '%s\tD\t0\t-\n' "$(encode_field "$base")" >> "$entries"
+            create_manifest "$actual" "$workdir/live-item.tsv" || return 1
+            while IFS=$'\t' read -r encoded kind size digest; do
+                child=$(decode_field "$encoded") || return 1
+                printf '%s\t%s\t%s\t%s\n' "$(encode_field "$base/$child")" "$kind" "$size" "$digest" >> "$entries"
+            done < "$workdir/live-item.tsv"
+        else
+            APPOFFLOAD_ERROR="Unsupported live migration item: $actual"
+            return 1
+        fi
+    done < "$inventory"
+    LC_ALL=C /usr/bin/sort -u "$entries" > "$output"
+}
+
+migration_current_app_for_backup() {
+    local package="$1" metadata original identifier size name candidate candidate_id match=""
+    MIGRATION_CURRENT_APP_RESOLVED=""
+    metadata="$package/metadata.conf"
+    original=$(decode_field "$(/usr/bin/awk -F= '$1 == "original_app_path" {print substr($0,index($0,"=")+1);exit}' "$metadata")")
+    identifier=$(decode_field "$(/usr/bin/awk -F= '$1 == "bundle_id" {print substr($0,index($0,"=")+1);exit}' "$metadata")")
+    if [ -d "$original" ]; then
+        candidate_id=$(plist_value "$original/Contents/Info.plist" CFBundleIdentifier)
+        if [ "$candidate_id" = "$identifier" ]; then MIGRATION_CURRENT_APP_RESOLVED="$original"; return 0; fi
+    fi
+    while IFS=$'\t' read -r size name candidate_id candidate; do
+        [ "$candidate_id" = "$identifier" ] || continue
+        [ -z "$match" ] || { APPOFFLOAD_ERROR="Multiple installed apps match $identifier; use the original app path."; return 1; }
+        match="$candidate"
+    done < <(list_migratable_apps)
+    [ -n "$match" ] || { APPOFFLOAD_ERROR="The app for this backup is not installed or its search location is unavailable: $identifier"; return 1; }
+    MIGRATION_CURRENT_APP_RESOLVED="$match"
+}
+
+# Return 0=current, 2=stale, 1=unable to validate. The backup itself is
+# checksum-verified before live files are compared, including network images.
+check_app_migration_freshness() {
+    local source="$1" package app workdir status=1
+    APPOFFLOAD_ERROR=""; LAST_MIGRATION_FRESHNESS=""; LAST_MIGRATION_CURRENT_APP=""
+    debug_log "migration-freshness.begin source=$source"
+    migration_open_backup_source "$source" || return 1
+    package="$MIGRATION_OPEN_PACKAGE"
+    if migration_current_app_for_backup "$package"; then
+        app="$MIGRATION_CURRENT_APP_RESOLVED"
+        LAST_MIGRATION_CURRENT_APP="$app"
+        workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-freshness.XXXXXX") || { APPOFFLOAD_ERROR="Could not create freshness workspace."; migration_close_backup_source; return 1; }
+        emit_progress "Checking backup freshness" 0 "Hashing current app and Library data"
+        if migration_live_manifest "$app" "$workdir/live.tsv" "$workdir"; then
+            if /usr/bin/cmp -s "$package/checksums.tsv" "$workdir/live.tsv"; then
+                LAST_MIGRATION_FRESHNESS="current"; status=0
+            else
+                LAST_MIGRATION_FRESHNESS="stale"; status=2
+            fi
+        else
+            [ -n "$APPOFFLOAD_ERROR" ] || APPOFFLOAD_ERROR="Could not hash the current app data."
+        fi
+        /bin/rm -rf "$workdir"
+    else
+        [ -n "$APPOFFLOAD_ERROR" ] || APPOFFLOAD_ERROR="Could not find the installed app for this backup."
+    fi
+    migration_close_backup_source
+    debug_log "migration-freshness.done source=$source status=${LAST_MIGRATION_FRESHNESS:-unknown}"
+    [ "$status" -eq 1 ] || emit_progress "Checking backup freshness" 100 "$LAST_MIGRATION_FRESHNESS"
+    return "$status"
+}
+
+# A refresh never overwrites or deletes its predecessor.
+update_app_migration_backup() {
+    local source="$1" app target relative status
+    LAST_MIGRATION_UPDATED=0
+    check_app_migration_freshness "$source"; status=$?
+    case "$status" in
+        0) LAST_MIGRATION_BACKUP="$source"; return 0 ;;
+        2) ;;
+        *) return 1 ;;
+    esac
+    app="$LAST_MIGRATION_CURRENT_APP"
+    case "$source" in "$VOLUMES_ROOT"/*) relative=${source#"$VOLUMES_ROOT"/}; target="$VOLUMES_ROOT/${relative%%/*}" ;; *) APPOFFLOAD_ERROR="Backup is not on a managed mounted volume."; return 1 ;; esac
+    create_app_migration_backup "$app" "$target" || return 1
+    LAST_MIGRATION_UPDATED=1
+}
+
 migration_open_backup_source() {
     local source="$1" mount package count
     MIGRATION_OPEN_MOUNT=""; MIGRATION_OPEN_PACKAGE=""
     case "$source" in
         *.appmigration.sparsebundle)
             migration_network_bundle_safe "$source" || { APPOFFLOAD_ERROR="Safety guard refused the network migration bundle path."; return 1; }
-            mount=$(migration_attach_sparsebundle "$source" 1) || return 1
+            migration_attach_sparsebundle "$source" 1 >/dev/null || return 1
+            mount="$MIGRATION_ATTACHED_MOUNT"
             count=0
             while IFS= read -r -d '' package; do MIGRATION_OPEN_PACKAGE="$package"; count=$((count + 1)); done < <(/usr/bin/find "$mount/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME" -type d -name '*.appbackup' -print0 2>/dev/null)
             if [ "$count" -ne 1 ]; then migration_detach_sparsebundle "$mount" >/dev/null 2>&1 || true; MIGRATION_OPEN_PACKAGE=""; APPOFFLOAD_ERROR="Network migration bundle must contain exactly one app backup."; return 1; fi
@@ -556,7 +671,8 @@ migration_copy_package_network() {
     if ! create_output=$("$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" 2>&1); then debug_log "sparsebundle.create.failed bundle=$bundle detail=$create_output"; APPOFFLOAD_ERROR="Could not create the destination sparsebundle."; return 1; fi
     debug_log "sparsebundle.create.done bundle=$bundle"
     ACTIVE_MIGRATION_NETWORK_BUNDLE="$bundle"
-    mount=$(migration_attach_sparsebundle "$bundle" 0) || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
+    migration_attach_sparsebundle "$bundle" 0 >/dev/null || { /bin/rm -rf "$bundle"; ACTIVE_MIGRATION_NETWORK_BUNDLE=""; return 1; }
+    mount="$MIGRATION_ATTACHED_MOUNT"
     ACTIVE_MIGRATION_MOUNT="$mount"; image_root="$mount/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"; destination="$image_root/$(/usr/bin/basename "$package")"; workdir="${TMPDIR:-/tmp}/appoffload-migration-network-move-$$"
     /bin/mkdir -p "$image_root" "$workdir" || { APPOFFLOAD_ERROR="Could not create staging inside the sparsebundle."; rollback_active_transaction; return 1; }
     ACTIVE_SOURCE="$package" ACTIVE_WORKDIR="$workdir" ACTIVE_PHASE="migration-network-move"

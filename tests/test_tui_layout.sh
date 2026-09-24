@@ -53,4 +53,46 @@ case "${MENU_LABELS[0]}" in *$'\033'*) fail "menu label contains ANSI control by
 [ "$(printf '\033' | read_key)" = $'\033' ] || fail "single Escape key was swallowed"
 [ "$(printf '\033[A' | read_key)" = $'\033[A' ] || fail "up arrow key was not decoded"
 
-echo "PASS: adaptive status-bar rules and clean restore menu labels"
+MENU_LABELS=("First app" "Second app" "Third app")
+MENU_VALUES=("first" "second" "third")
+printf ' j \n' > "$TEST_ROOT/multi-keys"
+menu_select_multiple "Batch selection test" < "$TEST_ROOT/multi-keys" >/dev/null || fail "batch selection failed"
+[ "${#SELECTED_VALUES[@]}" -eq 2 ] && [ "${SELECTED_VALUES[0]}" = "first" ] && [ "${SELECTED_VALUES[1]}" = "second" ] || fail "batch selection returned the wrong apps"
+
+# Bash 3.2 treats an empty "${array[@]}" as unbound under set -u. These
+# first-run menus must remain usable before any backup has been created.
+list_app_migration_backups() { :; }
+list_migratable_apps() { printf '2048\tExample\tcom.example.app\t%s\n' "$TEST_ROOT/Applications/Example.app"; }
+list_managed_migration_offloads() { :; }
+migration_offload_totals() { printf '0\t0\n'; }
+MIGRATION_APP_CACHE_READY=0; MIGRATION_BACKUP_CACHE_READY=0
+load_migratable_app_menu || fail "app menu failed with no backups"
+[ "${#MENU_VALUES[@]}" -eq 1 ] || fail "app menu lost app when there were no backups"
+load_migration_backup_menu || fail "backup menu failed with no backups"
+[ "${#MENU_VALUES[@]}" -eq 0 ] || fail "empty backup menu contained a backup"
+list_migratable_apps() { :; }
+MIGRATION_APP_CACHE_READY=0
+load_migratable_app_menu || fail "app menu failed with no apps or backups"
+[ "${#MENU_VALUES[@]}" -eq 0 ] || fail "empty app menu contained an app"
+
+list_app_migration_backups() { printf '1024\tExample\tcom.example.app\t2026-09-24\t%s\n' "$APPOFFLOAD_VOLUMES_ROOT/External/.AppSupportOffload/App Backups/com.example.app/example.appbackup"; }
+MIGRATION_BACKUP_CACHE_READY=0
+load_migration_backup_menu
+case "${MENU_LABELS[0]}" in *'@ External'*) ;; *) fail "backup list did not show destination disk" ;; esac
+
+list_migratable_apps() { printf x >> "$TEST_ROOT/app-scan-count"; printf '2048\tExample\tcom.example.app\t%s\n' "$TEST_ROOT/Applications/Example.app"; }
+list_managed_migration_offloads() { :; }
+migration_offload_totals() { printf '0\t0\n'; }
+list_app_migration_backups() { printf x >> "$TEST_ROOT/backup-scan-count"; printf '1024\tExample\tcom.example.app\t2026-09-24\t%s\n' "$APPOFFLOAD_VOLUMES_ROOT/External/.AppSupportOffload/App Backups/com.example.app/example.appbackup"; }
+MIGRATION_APP_CACHE_READY=0; MIGRATION_BACKUP_CACHE_READY=0
+load_migratable_app_menu
+case "${MENU_LABELS[0]}" in *'BACKUPS:1'*) ;; *) fail "app picker did not mark an existing backup" ;; esac
+load_migratable_app_menu
+[ "$(/usr/bin/wc -c < "$TEST_ROOT/app-scan-count")" -eq 1 ] || fail "app picker rescanned apps despite session cache"
+[ "$(/usr/bin/wc -c < "$TEST_ROOT/backup-scan-count")" -eq 1 ] || fail "app picker rescanned backups despite session cache"
+MIGRATION_BACKUP_CACHE_READY=0
+load_migratable_app_menu
+[ "$(/usr/bin/wc -c < "$TEST_ROOT/app-scan-count")" -eq 1 ] || fail "backup refresh unnecessarily rescanned apps"
+[ "$(/usr/bin/wc -c < "$TEST_ROOT/backup-scan-count")" -eq 2 ] || fail "invalidated backup cache did not refresh"
+
+echo "PASS: adaptive layout, backup locations, batch selection, and session cache"
