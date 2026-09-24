@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.2 — 2026-09-24
+
+- Clean failed local restore copies and surface abandoned restore staging in the
+  health center.
+- Journal restore and delete operations, record the old destination during
+  moves, and recover interrupted copy and cleanup phases safely.
+- Mark clean rollbacks as aborted and remove verified orphan copies after an
+  interrupted offload. Show untracked managed copies and uncataloged network
+  bundles in the health center for manual review.
+- Report app lookup, missing health records, lock contention, and unreadable
+  folder sizes accurately; accept trailing slashes on `.app` paths and make
+  Escape work in the TUI.
+- Retain a completed network sparsebundle when unmount fails and check free
+  space before moving a backup to a network destination.
+
 ## 0.4.1 — 2026-09-24
 
 - Show `OFFLOADED <size>` beside apps with managed Application Support data in

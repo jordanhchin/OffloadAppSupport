@@ -50,4 +50,7 @@ load_folder_menu offloaded
 [ "${#MENU_LABELS[@]}" -eq 1 ] || fail "offloaded folder menu fixture was not found"
 case "${MENU_LABELS[0]}" in *$'\033'*) fail "menu label contains ANSI control bytes" ;; esac
 
+[ "$(printf '\033' | read_key)" = $'\033' ] || fail "single Escape key was swallowed"
+[ "$(printf '\033[A' | read_key)" = $'\033[A' ] || fail "up arrow key was not decoded"
+
 echo "PASS: adaptive status-bar rules and clean restore menu labels"

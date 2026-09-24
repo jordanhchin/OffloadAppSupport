@@ -23,6 +23,9 @@ ACTIVE_FINAL=""
 ACTIVE_WORKDIR=""
 ACTIVE_COPY_PID=""
 ACTIVE_LINK_ROLLBACK=""
+ACTIVE_JOURNAL=""
+ACTIVE_OLD_DESTINATION=""
+ACTIVE_OPERATION=""
 LOCK_DIR=""
 REGISTRY_SOURCE=""
 REGISTRY_DESTINATION=""
@@ -40,6 +43,10 @@ emit_progress() {
     fi
 }
 
+new_transaction_id() {
+    printf '%s-%s-%s\n' "$(/bin/date +%Y%m%d-%H%M%S)" "$$" "$RANDOM"
+}
+
 human_bytes() {
     awk -v bytes="$1" 'BEGIN {
         split("B KB MB GB TB PB", unit, " "); i=1
@@ -51,8 +58,10 @@ human_bytes() {
 
 path_bytes() {
     local path="$1" blocks
-    blocks=$(/usr/bin/du -sk "$path" 2>/dev/null | /usr/bin/awk '{print $1}') || return 1
-    echo $((blocks * 1024))
+    blocks=$(/usr/bin/du -sk "$path" 2>/dev/null) || return 1
+    blocks=${blocks%%[[:space:]]*}
+    case "$blocks" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$((blocks * 1024))"
 }
 
 available_bytes() {
@@ -148,15 +157,20 @@ register_offload() {
 
 remove_offload_record() {
     local source="$1" temp a b c d e f found=0
-    [ -f "$OFFLOAD_REGISTRY_FILE" ] || return 0
+    APPOFFLOAD_ERROR=""
+    [ -f "$OFFLOAD_REGISTRY_FILE" ] || { APPOFFLOAD_ERROR="No health record exists for: $source"; return 1; }
     temp=$(/usr/bin/mktemp "$CONFIG_DIR/.offloads.XXXXXX") || return 1
     while IFS=$'\t' read -r a b c d e f; do
         [ -n "$a" ] || continue
         if [ "$(decode_field "$a")" = "$source" ]; then found=1; else printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$b" "$c" "$d" "$e" "$f" >> "$temp"; fi
     done < "$OFFLOAD_REGISTRY_FILE"
+    if [ "$found" -ne 1 ]; then
+        /bin/rm -f "$temp"
+        APPOFFLOAD_ERROR="No health record exists for: $source"
+        return 1
+    fi
     /bin/chmod 600 "$temp"
-    /bin/mv "$temp" "$OFFLOAD_REGISTRY_FILE"
-    [ "$found" -ge 0 ]
+    /bin/mv "$temp" "$OFFLOAD_REGISTRY_FILE" || { APPOFFLOAD_ERROR="Could not update the health registry."; return 1; }
 }
 
 sync_offload_registry() {
@@ -428,9 +442,17 @@ absolute_link_destination() {
     printf '%s\n' "$destination"
 }
 
+same_destination() {
+    local first="$1" second="$2"
+    [ -n "$first" ] && [ -n "$second" ] || return 1
+    if [ -d "$first" ]; then first=$(cd "$first" 2>/dev/null && pwd -P) || return 1; fi
+    if [ -d "$second" ]; then second=$(cd "$second" 2>/dev/null && pwd -P) || return 1; fi
+    [ "$first" = "$second" ]
+}
+
 health_scan() {
     local a b c d e recorded source destination identity volume_root relative name current mounted candidate detail
-    local volume stage journal phase backup base rest recovered_source user_name managed_root
+    local volume stage journal phase backup base rest recovered_source user_name managed_root candidate bundle
     sync_offload_registry
     if [ -f "$OFFLOAD_REGISTRY_FILE" ]; then
         while IFS=$'\t' read -r a b c d e recorded; do
@@ -481,11 +503,24 @@ health_scan() {
             [ -e "$stage" ] || continue
             printf 'warning\tstale-staging\t%s\t%s\t%s\tIncomplete staging copy can be removed\tclean-staging\n' "$(/usr/bin/basename "$stage")" "$stage" "$stage"
         done
+        for candidate in "$managed_root"/*; do
+            [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue
+            name=$(/usr/bin/basename "$candidate")
+            source="$APP_SUPPORT_ROOT/$name"
+            current=$(managed_link_destination "$source" 2>/dev/null || true)
+            same_destination "$current" "$candidate" && continue
+            if lookup_offload_record "$source" && same_destination "$REGISTRY_DESTINATION" "$candidate"; then continue; fi
+            printf 'warning\tuntracked-copy\t%s\t%s\t%s\tManaged copy has no active link or health record; review manually\tnone\n' "$name" "$candidate" "$candidate"
+        done
         for journal in "$volume/$MANAGED_DIR_NAME/.transactions"/*.state; do
             [ -f "$journal" ] || continue
             phase=$(/usr/bin/awk -F= '$1 == "phase" {print $2; exit}' "$journal")
             case "$phase" in complete|recovered|aborted) continue ;; esac
             printf 'warning\tincomplete-transaction\t%s\t%s\t%s\tTransaction stopped during phase: %s\trecover-transaction\n' "$(/usr/bin/basename "$journal")" "$journal" "$journal" "${phase:-unknown}"
+        done
+        for bundle in "$volume/$MANAGED_DIR_NAME/${APP_BACKUP_DIR_NAME:-App Backups}"/*/*.appmigration.sparsebundle; do
+            [ -d "$bundle" ] && [ ! -f "$bundle.appoffload.conf" ] || continue
+            printf 'warning\tuncataloged-backup\t%s\t%s\t%s\tSparsebundle has no catalog; unmount and review manually\tnone\n' "$(/usr/bin/basename "$bundle")" "$bundle" "$bundle"
         done
     done
     for backup in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*; do
@@ -499,6 +534,10 @@ health_scan() {
         else
             printf 'warning\tleftover-backup\t%s\t%s\t%s\tRollback copy remains; manual review recommended\tnone\n' "$name" "$backup" "$recovered_source"
         fi
+    done
+    for stage in "$APP_SUPPORT_ROOT"/.*.appoffload-restore-*; do
+        [ -e "$stage" ] || continue
+        printf 'warning\tstale-staging\t%s\t%s\t%s\tIncomplete local restore copy can be removed\tclean-staging\n' "$(/usr/bin/basename "$stage")" "$stage" "$stage"
     done
 }
 
@@ -540,6 +579,12 @@ is_health_staging_path() {
     esac
 }
 
+is_restore_staging_path() {
+    [ "$(/usr/bin/dirname "$1")" = "$APP_SUPPORT_ROOT" ] || return 1
+    case "$(/usr/bin/basename "$1")" in .*.appoffload-restore-*) return 0 ;; esac
+    return 1
+}
+
 is_health_journal_path() {
     case "$1" in
         "$VOLUMES_ROOT"/*/"$MANAGED_DIR_NAME"/.transactions/*.state) return 0 ;;
@@ -555,7 +600,7 @@ is_health_journal_path() {
 clean_health_staging() {
     local stage="$1"
     APPOFFLOAD_ERROR=""
-    is_health_staging_path "$stage" || { APPOFFLOAD_ERROR="Safety guard refused unexpected staging path: $stage"; return 1; }
+    { is_health_staging_path "$stage" || is_restore_staging_path "$stage"; } || { APPOFFLOAD_ERROR="Safety guard refused unexpected staging path: $stage"; return 1; }
     [ -e "$stage" ] || { APPOFFLOAD_ERROR="Staging path no longer exists."; return 1; }
     ensure_not_in_use "$stage" || return 1
     /bin/rm -rf "$stage"
@@ -572,7 +617,7 @@ recover_local_backup() {
 }
 
 recover_incomplete_transaction() {
-    local journal="$1" phase encoded source backup stage final temp
+    local journal="$1" phase encoded source backup stage final old_destination operation current="" workdir
     APPOFFLOAD_ERROR=""
     is_health_journal_path "$journal" || { APPOFFLOAD_ERROR="Safety guard refused unexpected transaction record."; return 1; }
     [ -f "$journal" ] || { APPOFFLOAD_ERROR="Transaction record no longer exists."; return 1; }
@@ -581,25 +626,105 @@ recover_incomplete_transaction() {
     encoded=$(/usr/bin/awk -F= '$1 == "backup" {print substr($0, index($0, "=")+1); exit}' "$journal"); backup=$(decode_field "$encoded")
     encoded=$(/usr/bin/awk -F= '$1 == "stage" {print substr($0, index($0, "=")+1); exit}' "$journal"); stage=$(decode_field "$encoded")
     encoded=$(/usr/bin/awk -F= '$1 == "final" {print substr($0, index($0, "=")+1); exit}' "$journal"); final=$(decode_field "$encoded")
+    encoded=$(/usr/bin/awk -F= '$1 == "old_destination" {print substr($0, index($0, "=")+1); exit}' "$journal"); old_destination=$(decode_field "$encoded")
+    operation=$(/usr/bin/awk -F= '$1 == "operation" {print $2; exit}' "$journal")
+    if [ -z "$operation" ]; then
+        case "$backup" in *appoffload-delete-*) operation=delete ;; *appoffload-backup-*) operation=offload ;; esac
+        [ -n "$old_destination" ] && operation=move
+    fi
     is_application_support_child "$source" || { APPOFFLOAD_ERROR="Transaction source failed its safety check."; return 1; }
     if [ -n "$backup" ]; then
-        case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) ;; *) APPOFFLOAD_ERROR="Transaction rollback path failed its safety check."; return 1 ;; esac
+        case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*|"$APP_SUPPORT_ROOT"/.*.appoffload-delete-*) ;; *) APPOFFLOAD_ERROR="Transaction rollback path failed its safety check."; return 1 ;; esac
     fi
-    [ -z "$stage" ] || is_health_staging_path "$stage" || { APPOFFLOAD_ERROR="Transaction staging path failed its safety check."; return 1; }
+    [ -z "$stage" ] || { is_health_staging_path "$stage" || is_restore_staging_path "$stage"; } || { APPOFFLOAD_ERROR="Transaction staging path failed its safety check."; return 1; }
     [ -z "$final" ] || is_managed_destination "$final" || { APPOFFLOAD_ERROR="Transaction destination failed its safety check."; return 1; }
-    if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
-        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
-            /bin/mv "$backup" "$source" || { APPOFFLOAD_ERROR="Could not restore the transaction rollback copy."; return 1; }
-        elif [ -L "$source" ] && [ -d "$(absolute_link_destination "$source" 2>/dev/null)" ]; then
-            case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-*) /bin/rm -rf "$backup" ;; esac
-        else
-            APPOFFLOAD_ERROR="Transaction needs manual review because both source and rollback data exist."
-            return 1
-        fi
-    fi
+    [ -z "$old_destination" ] || is_managed_destination "$old_destination" || { APPOFFLOAD_ERROR="Old destination failed its safety check."; return 1; }
+    [ -L "$source" ] && current=$(absolute_link_destination "$source" 2>/dev/null || true)
+    case "$operation" in
+        move)
+            if same_destination "$current" "$final" && [ -d "$final" ]; then
+                if [ -d "$old_destination" ]; then
+                    if [ "$phase" != "removing-old" ]; then
+                        workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-move-repair.XXXXXX") || return 1
+                        verify_trees "$old_destination" "$final" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
+                        /bin/rm -rf "$workdir"
+                    fi
+                    safe_remove_managed_destination "$old_destination" || return 1
+                fi
+                register_offload "$source" "$final" >/dev/null 2>&1 || true
+            elif same_destination "$current" "$old_destination" && [ -d "$old_destination" ]; then
+                [ ! -e "$final" ] || safe_remove_managed_destination "$final" || return 1
+            else
+                APPOFFLOAD_ERROR="Move needs manual review; the link does not point to either verified copy."
+                return 1
+            fi
+            ;;
+        restore)
+            if [ -d "$source" ] && [ ! -L "$source" ]; then
+                if [ -d "$final" ]; then
+                    if [ "$phase" != "removing-external" ]; then
+                        workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-restore-repair.XXXXXX") || return 1
+                        verify_trees "$final" "$source" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
+                        /bin/rm -rf "$workdir"
+                    fi
+                    safe_remove_managed_destination "$final" || return 1
+                fi
+                remove_offload_record "$source" >/dev/null 2>&1 || true
+            elif same_destination "$current" "$final" && [ -d "$final" ]; then :
+            elif [ ! -e "$source" ] && [ ! -L "$source" ] && [ -d "$final" ]; then
+                /bin/ln -s "$final" "$source" || return 1
+            else APPOFFLOAD_ERROR="Restore needs manual review; original data is unavailable."; return 1; fi
+            ;;
+        delete)
+            if [ "$phase" = "removing-external" ]; then
+                [ ! -e "$final" ] || safe_remove_managed_destination "$final" || return 1
+                [ ! -L "$backup" ] || /bin/unlink "$backup" || return 1
+                if [ -L "$source" ] && same_destination "$(absolute_link_destination "$source" 2>/dev/null || true)" "$final"; then
+                    /bin/unlink "$source" || return 1
+                fi
+                remove_offload_record "$source" >/dev/null 2>&1 || true
+            elif [ -d "$final" ]; then
+                if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+                    if [ -L "$backup" ]; then /bin/mv -h "$backup" "$source" || return 1
+                    else /bin/ln -s "$final" "$source" || return 1; fi
+                fi
+                same_destination "$(absolute_link_destination "$source" 2>/dev/null || true)" "$final" || { APPOFFLOAD_ERROR="Delete needs manual review; original path conflicts."; return 1; }
+                [ ! -L "$backup" ] || /bin/unlink "$backup" || return 1
+            else
+                [ ! -L "$backup" ] || /bin/unlink "$backup" || return 1
+                remove_offload_record "$source" >/dev/null 2>&1 || true
+            fi
+            ;;
+        offload|"")
+            if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+                if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+                    /bin/mv "$backup" "$source" || { APPOFFLOAD_ERROR="Could not restore the transaction rollback copy."; return 1; }
+                elif [ -L "$source" ] && same_destination "$(absolute_link_destination "$source" 2>/dev/null)" "$final" && [ -d "$final" ]; then
+                    if [ "$phase" != "removing-local" ]; then
+                        workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-offload-repair.XXXXXX") || return 1
+                        verify_trees "$backup" "$final" "$workdir" || { /bin/rm -rf "$workdir"; return 1; }
+                        /bin/rm -rf "$workdir"
+                    fi
+                    case "$backup" in "$APP_SUPPORT_ROOT"/.*.appoffload-*) /bin/rm -rf "$backup" ;; esac
+                else
+                    APPOFFLOAD_ERROR="Transaction needs manual review because both source and rollback data exist."
+                    return 1
+                fi
+            fi
+            if [ -d "$source" ] && [ ! -L "$source" ] && [ -d "$final" ]; then
+                workdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/appoffload-orphan-repair.XXXXXX") || return 1
+                verify_trees "$source" "$final" "$workdir" || { /bin/rm -rf "$workdir"; APPOFFLOAD_ERROR="The external copy differs from the local folder; review both copies manually."; return 1; }
+                /bin/rm -rf "$workdir"
+                safe_remove_managed_destination "$final" || return 1
+            fi
+            if [ -L "$source" ] && same_destination "$(absolute_link_destination "$source" 2>/dev/null || true)" "$final"; then
+                register_offload "$source" "$final" >/dev/null 2>&1 || true
+            fi
+            ;;
+        *) APPOFFLOAD_ERROR="Unknown transaction operation: $operation"; return 1 ;;
+    esac
     if [ -n "$stage" ] && [ -e "$stage" ]; then clean_health_staging "$stage" || return 1; fi
-    temp="${journal}.repair-$$"
-    /usr/bin/awk -F= 'BEGIN {OFS="="} $1 == "phase" {$2="recovered"} {print}' "$journal" > "$temp" && /bin/mv "$temp" "$journal"
+    mark_journal_phase "$journal" recovered
 }
 
 processes_using() {
@@ -738,7 +863,7 @@ acquire_lock() {
         return 1
     fi
     /bin/rm -rf "$LOCK_DIR"
-    /bin/mkdir "$LOCK_DIR" || return 1
+    /bin/mkdir "$LOCK_DIR" 2>/dev/null || { APPOFFLOAD_ERROR="Could not acquire the operation lock; another process may have taken it."; return 1; }
     printf '%s\n' "$$" > "$LOCK_DIR/pid"
 }
 
@@ -748,14 +873,24 @@ release_lock() {
 }
 
 write_journal() {
-    local file="$1" phase="$2"
+    local file="$1" phase="$2" temp="${1}.pending-$$"
     {
         printf 'version=1\nphase=%s\n' "$phase"
         printf 'source=%s\n' "$(encode_field "$ACTIVE_SOURCE")"
         printf 'backup=%s\n' "$(encode_field "$ACTIVE_BACKUP")"
         printf 'stage=%s\n' "$(encode_field "$ACTIVE_STAGE")"
         printf 'final=%s\n' "$(encode_field "$ACTIVE_FINAL")"
-    } > "$file"
+        printf 'old_destination=%s\n' "$(encode_field "$ACTIVE_OLD_DESTINATION")"
+        printf 'operation=%s\n' "$ACTIVE_OPERATION"
+    } > "$temp" || { /bin/rm -f "$temp"; return 1; }
+    /bin/mv "$temp" "$file" || { /bin/rm -f "$temp"; return 1; }
+}
+
+mark_journal_phase() {
+    local file="$1" phase="$2" temp
+    [ -n "$file" ] && [ -f "$file" ] || return 0
+    temp="${file}.phase-$$"
+    /usr/bin/awk -F= -v phase="$phase" 'BEGIN {OFS="="} $1 == "phase" {$2=phase} {print}' "$file" > "$temp" && /bin/mv "$temp" "$file"
 }
 
 clear_active_transaction() {
@@ -767,33 +902,63 @@ clear_active_transaction() {
     ACTIVE_WORKDIR=""
     ACTIVE_COPY_PID=""
     ACTIVE_LINK_ROLLBACK=""
+    ACTIVE_JOURNAL=""
+    ACTIVE_OLD_DESTINATION=""
+    ACTIVE_OPERATION=""
 }
 
 rollback_active_transaction() {
-    # Preserve the verified external copy. Only repair the local source path.
+    local clean=1 current=""
     if [ -n "$ACTIVE_COPY_PID" ] && /bin/kill -0 "$ACTIVE_COPY_PID" 2>/dev/null; then
         /bin/kill -TERM "$ACTIVE_COPY_PID" 2>/dev/null || true
         wait "$ACTIVE_COPY_PID" 2>/dev/null || true
         ACTIVE_COPY_PID=""
     fi
-    if [ -n "$ACTIVE_BACKUP" ] && { [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; }; then
-        if [ -L "$ACTIVE_SOURCE" ]; then
-            /bin/unlink "$ACTIVE_SOURCE" 2>/dev/null || true
+    if [ "$ACTIVE_OPERATION" != "delete" ] || [ "$ACTIVE_PHASE" != "removing-external" ]; then
+        if [ -n "$ACTIVE_BACKUP" ] && { [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; }; then
+            if [ -L "$ACTIVE_SOURCE" ]; then
+                /bin/unlink "$ACTIVE_SOURCE" 2>/dev/null || true
+            fi
+            if [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
+                /bin/mv "$ACTIVE_BACKUP" "$ACTIVE_SOURCE" 2>/dev/null || true
+            fi
         fi
-        if [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
-            /bin/mv "$ACTIVE_BACKUP" "$ACTIVE_SOURCE" 2>/dev/null || true
+        if [ -n "$ACTIVE_LINK_ROLLBACK" ] && [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
+            /bin/ln -s "$ACTIVE_LINK_ROLLBACK" "$ACTIVE_SOURCE" 2>/dev/null || true
         fi
-    fi
-    if [ -n "$ACTIVE_LINK_ROLLBACK" ] && [ ! -e "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ]; then
-        /bin/ln -s "$ACTIVE_LINK_ROLLBACK" "$ACTIVE_SOURCE" 2>/dev/null || true
     fi
     if type rollback_migration_commits >/dev/null 2>&1; then
         rollback_migration_commits
     fi
     if [ -n "$ACTIVE_STAGE" ] && [ -e "$ACTIVE_STAGE" ]; then
         case "$ACTIVE_STAGE" in
-            */.appoffload-staging-*) /bin/rm -rf "$ACTIVE_STAGE" ;;
+            */.appoffload-staging-*|"$APP_SUPPORT_ROOT"/.*.appoffload-restore-*) /bin/rm -rf "$ACTIVE_STAGE" || clean=0 ;;
         esac
+    fi
+    if [ -n "$ACTIVE_JOURNAL" ]; then
+        [ -L "$ACTIVE_SOURCE" ] && current=$(absolute_link_destination "$ACTIVE_SOURCE" 2>/dev/null || true)
+        case "$ACTIVE_OPERATION" in
+            offload)
+                if [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] && [ -d "$ACTIVE_FINAL" ]; then
+                    safe_remove_managed_destination "$ACTIVE_FINAL" || clean=0
+                fi
+                [ -d "$ACTIVE_SOURCE" ] && [ ! -L "$ACTIVE_SOURCE" ] || clean=0
+                ;;
+            move)
+                if same_destination "$current" "$ACTIVE_OLD_DESTINATION" && [ -d "$ACTIVE_FINAL" ]; then
+                    safe_remove_managed_destination "$ACTIVE_FINAL" || clean=0
+                fi
+                same_destination "$current" "$ACTIVE_OLD_DESTINATION" || clean=0
+                ;;
+            restore) same_destination "$current" "$ACTIVE_FINAL" || clean=0 ;;
+            delete)
+                if [ "$ACTIVE_PHASE" = "removing-external" ]; then clean=0
+                else same_destination "$current" "$ACTIVE_FINAL" && [ -d "$ACTIVE_FINAL" ] || clean=0; fi
+                ;;
+        esac
+        if [ -n "$ACTIVE_BACKUP" ] && { [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; }; then clean=0; fi
+        if [ -n "$ACTIVE_STAGE" ] && [ -e "$ACTIVE_STAGE" ]; then clean=0; fi
+        [ "$clean" -eq 1 ] && mark_journal_phase "$ACTIVE_JOURNAL" aborted
     fi
     if [ -n "$ACTIVE_WORKDIR" ] && [ -d "$ACTIVE_WORKDIR" ]; then
         case "$ACTIVE_WORKDIR" in
@@ -839,7 +1004,7 @@ offload_folder() {
     user_name=${USER:-$(/usr/bin/id -un)}
     managed_root="$target/$MANAGED_DIR_NAME/$user_name/Application Support"
     transaction_root="$target/$MANAGED_DIR_NAME/.transactions"
-    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    transaction_id=$(new_transaction_id)
     final="$managed_root/$name"
     stage="$managed_root/.appoffload-staging-$transaction_id-$name"
     backup="$APP_SUPPORT_ROOT/.$name.appoffload-backup-$transaction_id"
@@ -865,9 +1030,9 @@ offload_folder() {
         release_lock
         return 1
     }
-    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$backup" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir"
+    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$backup" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir" ACTIVE_JOURNAL="$journal" ACTIVE_OPERATION="offload"
     ACTIVE_PHASE="copying"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not create the offload journal."; rollback_active_transaction; return 1; }
     emit_progress "Preflight" 100 "Apps closed; space available"
 
     if ! copy_with_progress "$source" "$stage" "$total"; then
@@ -881,14 +1046,14 @@ offload_folder() {
     ensure_not_in_use "$source" || { rollback_active_transaction; return 1; }
     copy_verified=1
     ACTIVE_PHASE="verified"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not update the offload journal."; rollback_active_transaction; return 1; }
 
     emit_progress "Switching to symlink" 20 "Committing verified copy"
     /bin/mv "$stage" "$final" || { APPOFFLOAD_ERROR="Could not commit the external copy."; rollback_active_transaction; return 1; }
     ACTIVE_STAGE=""
     /bin/mv "$source" "$backup" || { APPOFFLOAD_ERROR="Could not create the local rollback copy."; rollback_active_transaction; return 1; }
     ACTIVE_PHASE="source-moved"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not update the offload journal."; rollback_active_transaction; return 1; }
     if ! /bin/ln -s "$final" "$source"; then
         APPOFFLOAD_ERROR="Could not create the symbolic link; the local folder was restored."
         rollback_active_transaction
@@ -901,17 +1066,21 @@ offload_folder() {
     }
     emit_progress "Switching to symlink" 100 "Link is active"
     ACTIVE_PHASE="linked"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not update the offload journal."; rollback_active_transaction; return 1; }
 
     emit_progress "Cleaning local copy" 30 "Removing verified rollback copy"
+    ACTIVE_PHASE="removing-local"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not update the offload journal."; rollback_active_transaction; return 1; }
     case "$backup" in
-        "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*) /bin/rm -rf "$backup" ;;
+        "$APP_SUPPORT_ROOT"/.*.appoffload-backup-*)
+            /bin/rm -rf "$backup" || { APPOFFLOAD_ERROR="The link is active, but the local rollback copy could not be removed: $backup"; release_lock; clear_active_transaction; return 1; }
+            ;;
         *) APPOFFLOAD_ERROR="Safety guard refused to remove unexpected backup path: $backup"; release_lock; return 1 ;;
     esac
     emit_progress "Cleaning local copy" 100 "Local space reclaimed"
     ACTIVE_BACKUP=""
     ACTIVE_PHASE="complete"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Offload is active, but the journal could not be completed."; release_lock; clear_active_transaction; return 1; }
     register_offload "$source" "$(cd "$final" && pwd -P)" "$(cd "$target" && pwd -P)" >/dev/null 2>&1 || true
     /bin/rm -rf "$workdir"
     release_lock
@@ -922,7 +1091,7 @@ offload_folder() {
 }
 
 restore_folder() {
-    local source="$1" destination name transaction_id staging workdir total free required
+    local source="$1" destination name transaction_id staging workdir journal total free required
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -938,7 +1107,7 @@ restore_folder() {
     ensure_not_in_use "$destination" || return 1
     acquire_lock || return 1
     name=$(/usr/bin/basename "$source")
-    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    transaction_id=$(new_transaction_id)
     staging="$APP_SUPPORT_ROOT/.$name.appoffload-restore-$transaction_id"
     workdir="${TMPDIR:-/tmp}/appoffload-restore-$transaction_id"
     total=$(path_bytes "$destination") || { APPOFFLOAD_ERROR="Could not measure external data."; release_lock; return 1; }
@@ -950,25 +1119,36 @@ restore_folder() {
         return 1
     fi
     /bin/mkdir -p "$workdir" || { APPOFFLOAD_ERROR="Could not create restore workspace."; release_lock; return 1; }
-    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$staging" ACTIVE_FINAL="$destination" ACTIVE_WORKDIR="$workdir" ACTIVE_PHASE="restoring"
+    journal="$destination"
+    journal="${journal%/*/Application Support/*}/.transactions/$transaction_id.state"
+    /bin/mkdir -p "${journal%/*}" || { APPOFFLOAD_ERROR="Could not create restore transaction record directory."; /bin/rm -rf "$workdir"; release_lock; return 1; }
+    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$staging" ACTIVE_FINAL="$destination" ACTIVE_WORKDIR="$workdir" ACTIVE_LINK_ROLLBACK="$destination" ACTIVE_JOURNAL="$journal" ACTIVE_OPERATION="restore" ACTIVE_PHASE="restoring"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not create the restore journal."; rollback_active_transaction; return 1; }
 
     copy_with_progress "$destination" "$staging" "$total" || { rollback_active_transaction; return 1; }
     verify_trees "$destination" "$staging" "$workdir" || { rollback_active_transaction; return 1; }
     emit_progress "Switching to local" 30 "Replacing managed link"
     /bin/unlink "$source" || { APPOFFLOAD_ERROR="Could not remove the managed link."; rollback_active_transaction; return 1; }
     if ! /bin/mv "$staging" "$source"; then
-        /bin/ln -s "$destination" "$source" 2>/dev/null || true
         APPOFFLOAD_ERROR="Could not activate the restored folder; the external link was recreated."
-        release_lock
+        rollback_active_transaction
         return 1
     fi
     ACTIVE_STAGE=""
+    ACTIVE_PHASE="local-active"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Local restore is active, but the journal could not be updated."; release_lock; clear_active_transaction; return 1; }
     emit_progress "Switching to local" 100 "Local folder is active"
-    case "$destination" in
-        */"$MANAGED_DIR_NAME"/*/Application\ Support/*) /bin/rm -rf "$destination" ;;
-        *) APPOFFLOAD_ERROR="Restore succeeded, but the safety guard retained the external copy: $destination"; release_lock; return 1 ;;
-    esac
+    ACTIVE_PHASE="removing-external"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Local restore is active, but the cleanup journal could not be updated."; release_lock; clear_active_transaction; return 1; }
+    if ! safe_remove_managed_destination "$destination"; then
+        APPOFFLOAD_ERROR="Restore activated the local folder, but the external copy could not be removed: $destination"
+        release_lock
+        clear_active_transaction
+        return 1
+    fi
     remove_offload_record "$source" >/dev/null 2>&1 || true
+    ACTIVE_PHASE="complete"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Restore succeeded, but the journal could not be completed."; release_lock; clear_active_transaction; return 1; }
     /bin/rm -rf "$workdir"
     release_lock
     clear_active_transaction
@@ -983,7 +1163,7 @@ safe_remove_managed_destination() {
         APPOFFLOAD_ERROR="Safety guard refused unexpected managed-data path: $destination"
         return 1
     }
-    /bin/rm -rf "$destination"
+    /bin/rm -rf "$destination" || { APPOFFLOAD_ERROR="Could not remove managed data: $destination"; return 1; }
 }
 
 move_offload() {
@@ -1013,7 +1193,7 @@ move_offload() {
     user_name=${USER:-$(/usr/bin/id -un)}
     managed_root="$target/$MANAGED_DIR_NAME/$user_name/Application Support"
     transaction_root="$target/$MANAGED_DIR_NAME/.transactions"
-    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    transaction_id=$(new_transaction_id)
     final="$managed_root/$name"
     stage="$managed_root/.appoffload-staging-$transaction_id-$name"
     temporary_link="$APP_SUPPORT_ROOT/.$name.appoffload-link-$transaction_id"
@@ -1042,8 +1222,8 @@ move_offload() {
         release_lock
         return 1
     }
-    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir" ACTIVE_LINK_ROLLBACK="$old_destination" ACTIVE_PHASE="moving"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    ACTIVE_SOURCE="$source" ACTIVE_STAGE="$stage" ACTIVE_FINAL="$final" ACTIVE_WORKDIR="$workdir" ACTIVE_LINK_ROLLBACK="$old_destination" ACTIVE_OLD_DESTINATION="$old_destination" ACTIVE_JOURNAL="$journal" ACTIVE_OPERATION="move" ACTIVE_PHASE="moving"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not create the move journal."; rollback_active_transaction; return 1; }
     emit_progress "Preflight" 100 "Source idle; target space available"
     copy_with_progress "$old_destination" "$stage" "$total" || { rollback_active_transaction; return 1; }
     verify_trees "$old_destination" "$stage" "$workdir" || { rollback_active_transaction; return 1; }
@@ -1066,6 +1246,10 @@ move_offload() {
     }
     emit_progress "Switching offload" 100 "New external copy is active"
     ACTIVE_LINK_ROLLBACK=""
+    ACTIVE_PHASE="new-link-active"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="New offload is active, but the journal could not be updated."; release_lock; clear_active_transaction; return 1; }
+    ACTIVE_PHASE="removing-old"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="New offload is active, but the cleanup journal could not be updated."; release_lock; clear_active_transaction; return 1; }
     if ! safe_remove_managed_destination "$old_destination"; then
         release_lock
         clear_active_transaction
@@ -1074,7 +1258,7 @@ move_offload() {
     register_offload "$source" "$(cd "$final" && pwd -P)" "$(cd "$target" && pwd -P)" >/dev/null 2>&1 || true
     /bin/rm -rf "$workdir"
     ACTIVE_PHASE="complete"
-    write_journal "$journal" "$ACTIVE_PHASE"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Move succeeded, but the journal could not be completed."; release_lock; clear_active_transaction; return 1; }
     release_lock
     clear_active_transaction
     LAST_EXTERNAL_BYTES=$total
@@ -1082,7 +1266,7 @@ move_offload() {
 }
 
 delete_offload() {
-    local source="$1" destination name transaction_id link_backup total
+    local source="$1" destination name transaction_id link_backup total journal
     APPOFFLOAD_ERROR=""
     LAST_LOCAL_DELTA_BYTES=0
     LAST_EXTERNAL_BYTES=0
@@ -1098,24 +1282,32 @@ delete_offload() {
     ensure_not_in_use "$destination" || return 1
     acquire_lock || return 1
     name=$(/usr/bin/basename "$source")
-    transaction_id="$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    transaction_id=$(new_transaction_id)
     link_backup="$APP_SUPPORT_ROOT/.$name.appoffload-delete-$transaction_id"
     total=$(path_bytes "$destination") || { APPOFFLOAD_ERROR="Could not measure external data."; release_lock; return 1; }
-    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$link_backup" ACTIVE_LINK_ROLLBACK="$destination" ACTIVE_PHASE="deleting"
+    journal="${destination%/*/Application Support/*}/.transactions/$transaction_id.state"
+    /bin/mkdir -p "${journal%/*}" || { APPOFFLOAD_ERROR="Could not create delete transaction record directory."; release_lock; return 1; }
+    ACTIVE_SOURCE="$source" ACTIVE_BACKUP="$link_backup" ACTIVE_FINAL="$destination" ACTIVE_LINK_ROLLBACK="$destination" ACTIVE_JOURNAL="$journal" ACTIVE_OPERATION="delete" ACTIVE_PHASE="deleting"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not create the delete journal."; rollback_active_transaction; return 1; }
     if ! /bin/mv -h "$source" "$link_backup"; then
         APPOFFLOAD_ERROR="Could not deactivate the managed link."
-        release_lock
-        clear_active_transaction
+        rollback_active_transaction
         return 1
     fi
     emit_progress "Deleting offload" 35 "Managed link deactivated"
+    ACTIVE_PHASE="removing-external"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Could not update the delete journal."; rollback_active_transaction; return 1; }
     if ! safe_remove_managed_destination "$destination"; then
         rollback_active_transaction
         return 1
     fi
-    [ -L "$link_backup" ] && /bin/unlink "$link_backup"
+    if [ -L "$link_backup" ]; then
+        /bin/unlink "$link_backup" || { APPOFFLOAD_ERROR="The external data was removed, but its hidden link could not be removed: $link_backup"; release_lock; clear_active_transaction; return 1; }
+    fi
     remove_offload_record "$source" >/dev/null 2>&1 || true
     ACTIVE_BACKUP="" ACTIVE_LINK_ROLLBACK=""
+    ACTIVE_PHASE="complete"
+    write_journal "$journal" "$ACTIVE_PHASE" || { APPOFFLOAD_ERROR="Offload was deleted, but the journal could not be completed."; release_lock; clear_active_transaction; return 1; }
     release_lock
     clear_active_transaction
     LAST_EXTERNAL_BYTES=$total

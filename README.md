@@ -170,7 +170,9 @@ independent backup until each restored app has been opened and validated.
 ### Health and Repair Center
 
 Choose **Health and repair center** in the TUI, or run `appoffload health`, to
-check every known offload plus transaction and recovery artifacts. AppSupport
+check every known offload plus transaction and recovery artifacts, including
+hidden local copies left by an interrupted restore, untracked external copies,
+and network sparsebundles without catalog metadata. AppSupport
 Offload records each target disk's stable volume identity in
 `~/.config/appoffload/offloads.tsv`; this lets it find the same disk after its
 volume name or mount path changes.

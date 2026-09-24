@@ -56,11 +56,38 @@ assert_file "$MOVED_DESTINATION/settings.json"
 [ "$LAST_LOCAL_DELTA_BYTES" -eq 0 ] || fail "external move incorrectly reported local disk change"
 [ "$LAST_EXTERNAL_BYTES" -gt 0 ] || fail "external move did not report transferred bytes"
 
+# A failed verification must remove the full local restore copy and close its journal.
+ORIGINAL_VERIFY_TREES=$(declare -f verify_trees)
+verify_trees() { APPOFFLOAD_ERROR="Injected verification failure"; return 1; }
+if restore_folder "$SOURCE"; then fail "injected restore verification failure was accepted"; fi
+eval "$ORIGINAL_VERIFY_TREES"
+assert_link "$SOURCE"
+for RESTORE_STAGE in "$APP_SUPPORT_ROOT"/."$(basename "$SOURCE")".appoffload-restore-*; do
+    [ ! -e "$RESTORE_STAGE" ] || fail "failed restore retained a full local staging copy"
+done
+if health_scan | /usr/bin/awk -F '\t' '$2 == "incomplete-transaction" {found=1} END {exit !found}'; then
+    fail "cleanly rolled-back restore was reported as incomplete"
+fi
+if path_bytes "$TEST_ROOT/no-such-folder" >/dev/null; then fail "unmeasurable folder was treated as zero bytes"; fi
+
 restore_folder "$SOURCE" || fail "$APPOFFLOAD_ERROR"
 assert_dir "$SOURCE"
 assert_file "$SOURCE/nested folder/data file.txt"
 [ ! -e "$MOVED_DESTINATION" ] || fail "external copy retained after successful restore"
 [ "$LAST_LOCAL_DELTA_BYTES" -lt 0 ] || fail "restore did not report consumed bytes"
+
+FAILED_OFFLOAD_SOURCE="$APP_SUPPORT_ROOT/Failed Offload"
+mkdir -p "$FAILED_OFFLOAD_SOURCE"
+printf 'original stays local\n' > "$FAILED_OFFLOAD_SOURCE/state"
+ORIGINAL_VERIFY_TREES=$(declare -f verify_trees)
+verify_trees() { APPOFFLOAD_ERROR="Injected offload verification failure"; return 1; }
+if offload_folder "$FAILED_OFFLOAD_SOURCE" "$TARGET"; then fail "injected offload verification failure was accepted"; fi
+eval "$ORIGINAL_VERIFY_TREES"
+assert_dir "$FAILED_OFFLOAD_SOURCE"
+[ ! -e "$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Failed Offload" ] || fail "failed offload left an external copy"
+if health_scan | /usr/bin/awk -F '\t' '$2 == "incomplete-transaction" {found=1} END {exit !found}'; then
+    fail "cleanly rolled-back offload was reported as incomplete"
+fi
 
 # Permanent deletion removes both the managed link and external data.
 DELETE_SOURCE="$APP_SUPPORT_ROOT/Delete Me"
@@ -174,6 +201,10 @@ printf 'preference data\n' > "$MIGRATION_PREF"
 printf 'sandbox data\n' > "$MIGRATION_CONTAINER/container.db"
 offload_folder "$MIGRATION_SUPPORT" "$TARGET" || fail "$APPOFFLOAD_ERROR"
 MIGRATION_EXTERNAL=$(managed_link_destination "$MIGRATION_SUPPORT") || fail "migration fixture was not offloaded"
+resolve_migratable_app "$MIGRATION_APP/" >/dev/null || fail "app path with trailing slash was rejected"
+[ "$RESOLVED_MIGRATABLE_APP" = "$(cd "$MIGRATION_APP" && pwd -P)" ] || fail "trailing-slash app resolved incorrectly"
+LOOKUP_ERROR=$("$ROOT/bin/appoffload" app inspect NoSuchInstalledApp 2>&1) && fail "missing app lookup succeeded"
+assert_contains "$LOOKUP_ERROR" "No installed app matches: NoSuchInstalledApp"
 MIGRATION_OFFLOAD_REPORT="$TEST_ROOT/migration-offloads.tsv"
 list_managed_migration_offloads > "$MIGRATION_OFFLOAD_REPORT"
 /usr/bin/awk -F '\t' '$1 > 0 && $2 == "com.example.Migrator" {found=1} END {exit !found}' "$MIGRATION_OFFLOAD_REPORT" || fail "managed migration offload was not indexed"
@@ -229,7 +260,7 @@ for argument in "$@"; do last="$argument"; done
 case "$command" in
     create) mkdir -p "$last/mount" ;;
     attach) printf '/dev/disk-test\tApple_APFS\t%s\n' "$last/mount" ;;
-    detach) exit 0 ;;
+    detach) [ "${APPOFFLOAD_FAKE_DETACH_FAIL:-0}" != "1" ] ;;
     *) exit 2 ;;
 esac
 MOCK
@@ -253,6 +284,24 @@ case "$NETWORK_MOVED_BACKUP" in *.appmigration.sparsebundle) ;; *) fail "native-
 delete_app_migration_backup "$NETWORK_MOVED_BACKUP" || fail "$APPOFFLOAD_ERROR"
 [ ! -e "$NETWORK_MOVED_BACKUP" ] && [ ! -e "$NETWORK_MOVED_BACKUP.appoffload.conf" ] || fail "network backup removal left managed files"
 
+ORIGINAL_AVAILABLE_BYTES=$(declare -f available_bytes)
+available_bytes() { printf '0\n'; }
+if move_app_migration_backup "$MIGRATION_BACKUP" "$NETWORK_TARGET"; then fail "network move ignored insufficient target space"; fi
+assert_contains "$APPOFFLOAD_ERROR" "Not enough network space"
+eval "$ORIGINAL_AVAILABLE_BYTES"
+
+export APPOFFLOAD_FAKE_DETACH_FAIL=1
+if move_app_migration_backup "$MIGRATION_BACKUP" "$NETWORK_TARGET"; then fail "failed sparsebundle detach was accepted"; fi
+assert_contains "$APPOFFLOAD_ERROR" "retained at"
+assert_dir "$MIGRATION_BACKUP"
+RETAINED_BUNDLE=$(/usr/bin/find "$NETWORK_TARGET" -name '*.appmigration.sparsebundle' -type d -print -quit)
+[ -n "$RETAINED_BUNDLE" ] || fail "failed unmount discarded the completed sparsebundle"
+health_scan > "$TEST_ROOT/network-health.tsv"
+/usr/bin/awk -F '\t' -v p="$RETAINED_BUNDLE" '$2 == "uncataloged-backup" && $4 == p {found=1} END {exit !found}' "$TEST_ROOT/network-health.tsv" || fail "retained sparsebundle was not visible in health scan"
+rollback_active_transaction
+[ -d "$RETAINED_BUNDLE" ] || fail "later rollback deleted a retained sparsebundle"
+unset APPOFFLOAD_FAKE_DETACH_FAIL
+
 printf 'tamper\n' >> "$MIGRATION_BACKUP/payload/Library/Application Support/com.example.Migrator/state.db"
 if verify_app_migration_backup "$MIGRATION_BACKUP"; then fail "migration verification accepted modified payload data"; fi
 assert_contains "$APPOFFLOAD_ERROR" "checksum verification failed"
@@ -271,6 +320,8 @@ printf 'health-volume-id\n' > "$HEALTH_OLD/.appoffload-volume-id"
 printf 'healthy data\n' > "$HEALTH_SOURCE/state.db"
 offload_folder "$HEALTH_SOURCE" "$HEALTH_OLD" || fail "$APPOFFLOAD_ERROR"
 lookup_offload_record "$HEALTH_SOURCE" || fail "offload registry record was not created"
+if remove_offload_record "$APP_SUPPORT_ROOT/Not Registered"; then fail "forgetting an unknown health record reported success"; fi
+assert_contains "$APPOFFLOAD_ERROR" "No health record exists"
 HEALTH_REPORT="$TEST_ROOT/health.tsv"
 health_scan > "$HEALTH_REPORT"
 /usr/bin/awk -F '\t' -v p="$HEALTH_SOURCE" '$2 == "healthy" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "healthy offload was not reported"
@@ -304,6 +355,14 @@ health_scan > "$HEALTH_REPORT"
 clean_health_staging "$STALE_STAGE" || fail "$APPOFFLOAD_ERROR"
 [ ! -e "$STALE_STAGE" ] || fail "stale staging was not removed"
 
+STALE_LOCAL_RESTORE="$APP_SUPPORT_ROOT/.Stale Local.appoffload-restore-test"
+mkdir -p "$STALE_LOCAL_RESTORE"
+printf 'incomplete copy\n' > "$STALE_LOCAL_RESTORE/partial"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$STALE_LOCAL_RESTORE" '$2 == "stale-staging" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "local restore staging was not detected"
+clean_health_staging "$STALE_LOCAL_RESTORE" || fail "$APPOFFLOAD_ERROR"
+[ ! -e "$STALE_LOCAL_RESTORE" ] || fail "local restore staging was not removed"
+
 TXN_SOURCE="$APP_SUPPORT_ROOT/Interrupted App"
 TXN_BACKUP="$APP_SUPPORT_ROOT/.Interrupted App.appoffload-backup-test"
 TXN_STAGE="$HEALTH_NEW/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/.appoffload-staging-transaction"
@@ -323,6 +382,62 @@ recover_incomplete_transaction "$TXN_JOURNAL" || fail "$APPOFFLOAD_ERROR"
 assert_dir "$TXN_SOURCE"
 [ ! -e "$TXN_STAGE" ] || fail "transaction staging remained after recovery"
 [ "$(/usr/bin/awk -F= '$1 == "phase" {print $2}' "$TXN_JOURNAL")" = "recovered" ] || fail "transaction was not marked recovered"
+
+MOVE_REPAIR_SOURCE="$APP_SUPPORT_ROOT/Interrupted Move"
+MOVE_REPAIR_OLD="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Move"
+MOVE_REPAIR_NEW="$TARGET2/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Move"
+MOVE_REPAIR_JOURNAL="$TARGET2/$MANAGED_DIR_NAME/.transactions/interrupted-move.state"
+mkdir -p "$MOVE_REPAIR_OLD" "$MOVE_REPAIR_NEW" "$(dirname "$MOVE_REPAIR_JOURNAL")"
+printf 'same data\n' > "$MOVE_REPAIR_OLD/state"
+printf 'same data\n' > "$MOVE_REPAIR_NEW/state"
+ln -s "$MOVE_REPAIR_NEW" "$MOVE_REPAIR_SOURCE"
+{
+    printf 'version=1\nphase=new-link-active\noperation=move\n'
+    printf 'source=%s\n' "$(encode_field "$MOVE_REPAIR_SOURCE")"
+    printf 'backup=%s\nstage=%s\n' "$(encode_field "")" "$(encode_field "")"
+    printf 'final=%s\n' "$(encode_field "$MOVE_REPAIR_NEW")"
+    printf 'old_destination=%s\n' "$(encode_field "$MOVE_REPAIR_OLD")"
+} > "$MOVE_REPAIR_JOURNAL"
+recover_incomplete_transaction "$MOVE_REPAIR_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+assert_link "$MOVE_REPAIR_SOURCE"
+[ ! -e "$MOVE_REPAIR_OLD" ] || fail "interrupted move recovery retained the old verified copy"
+[ "$(readlink "$MOVE_REPAIR_SOURCE")" = "$MOVE_REPAIR_NEW" ] || fail "interrupted move recovery changed the active link"
+
+ORPHAN_SOURCE="$APP_SUPPORT_ROOT/Interrupted Commit"
+ORPHAN_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Commit"
+ORPHAN_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/interrupted-commit.state"
+mkdir -p "$ORPHAN_SOURCE" "$ORPHAN_FINAL"
+printf 'same data\n' > "$ORPHAN_SOURCE/state"
+printf 'same data\n' > "$ORPHAN_FINAL/state"
+{
+    printf 'version=1\nphase=verified\noperation=offload\n'
+    printf 'source=%s\n' "$(encode_field "$ORPHAN_SOURCE")"
+    printf 'backup=%s\n' "$(encode_field "$APP_SUPPORT_ROOT/.Interrupted Commit.appoffload-backup-test")"
+    printf 'stage=%s\n' "$(encode_field "")"
+    printf 'final=%s\n' "$(encode_field "$ORPHAN_FINAL")"
+} > "$ORPHAN_JOURNAL"
+health_scan > "$HEALTH_REPORT"
+/usr/bin/awk -F '\t' -v p="$ORPHAN_FINAL" '$2 == "untracked-copy" && $4 == p {found=1} END {exit !found}' "$HEALTH_REPORT" || fail "orphan external copy was not visible in health scan"
+recover_incomplete_transaction "$ORPHAN_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+assert_dir "$ORPHAN_SOURCE"
+[ ! -e "$ORPHAN_FINAL" ] || fail "interrupted offload left an orphan external copy"
+
+DELETE_REPAIR_SOURCE="$APP_SUPPORT_ROOT/Interrupted Delete"
+DELETE_REPAIR_FINAL="$TARGET/$MANAGED_DIR_NAME/${USER:-$(id -un)}/Application Support/Interrupted Delete"
+DELETE_REPAIR_BACKUP="$APP_SUPPORT_ROOT/.Interrupted Delete.appoffload-delete-test"
+DELETE_REPAIR_JOURNAL="$TARGET/$MANAGED_DIR_NAME/.transactions/interrupted-delete.state"
+mkdir -p "$DELETE_REPAIR_FINAL"
+printf 'partial data\n' > "$DELETE_REPAIR_FINAL/state"
+ln -s "$DELETE_REPAIR_FINAL" "$DELETE_REPAIR_BACKUP"
+{
+    printf 'version=1\nphase=removing-external\noperation=delete\n'
+    printf 'source=%s\n' "$(encode_field "$DELETE_REPAIR_SOURCE")"
+    printf 'backup=%s\n' "$(encode_field "$DELETE_REPAIR_BACKUP")"
+    printf 'stage=%s\n' "$(encode_field "")"
+    printf 'final=%s\n' "$(encode_field "$DELETE_REPAIR_FINAL")"
+} > "$DELETE_REPAIR_JOURNAL"
+recover_incomplete_transaction "$DELETE_REPAIR_JOURNAL" || fail "$APPOFFLOAD_ERROR"
+[ ! -e "$DELETE_REPAIR_FINAL" ] && [ ! -L "$DELETE_REPAIR_BACKUP" ] || fail "interrupted delete recovery retained data or its link"
 
 if clean_health_staging "$TEST_ROOT/not-managed/.AppSupportOffload/user/Application Support/.appoffload-staging-bad"; then
     fail "staging cleanup accepted a path outside the volume root"

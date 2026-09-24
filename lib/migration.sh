@@ -60,8 +60,11 @@ list_migratable_apps() {
 
 resolve_migratable_app() {
     local requested="$1" size name identifier path match=""
+    RESOLVED_MIGRATABLE_APP=""
+    while [ "${requested%/}" != "$requested" ]; do requested=${requested%/}; done
     if [ -d "$requested" ] && [ "${requested##*.}" = "app" ]; then
-        cd "$requested" 2>/dev/null && pwd -P
+        RESOLVED_MIGRATABLE_APP=$(cd "$requested" 2>/dev/null && pwd -P) || { APPOFFLOAD_ERROR="Could not read app: $requested"; return 1; }
+        printf '%s\n' "$RESOLVED_MIGRATABLE_APP"
         return
     fi
     while IFS=$'\t' read -r size name identifier path; do
@@ -71,6 +74,7 @@ resolve_migratable_app() {
         fi
     done < <(list_migratable_apps)
     [ -n "$match" ] || { APPOFFLOAD_ERROR="No installed app matches: $requested"; return 1; }
+    RESOLVED_MIGRATABLE_APP="$match"
     printf '%s\n' "$match"
 }
 
@@ -388,7 +392,11 @@ create_app_migration_network_backup() {
         return 1
     fi
     saved_name="$LAST_MIGRATION_APP_NAME"; saved_count="$LAST_MIGRATION_ITEM_COUNT"; saved_offloaded="$LAST_MIGRATION_OFFLOADED_COUNT"; saved_bytes="$LAST_EXTERNAL_BYTES"
-    if ! migration_detach_sparsebundle "$mount"; then ACTIVE_MIGRATION_MOUNT="$mount"; return 1; fi
+    if ! migration_detach_sparsebundle "$mount"; then
+        APPOFFLOAD_ERROR="Could not unmount the completed sparsebundle; it was retained at $bundle."
+        ACTIVE_MIGRATION_MOUNT=""; ACTIVE_MIGRATION_NETWORK_BUNDLE=""
+        return 1
+    fi
     ACTIVE_MIGRATION_MOUNT=""
     {
         printf 'format=1\ntransport=sparsebundle\ncreated_at=%s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -506,11 +514,14 @@ migration_copy_package_native() {
 }
 
 migration_copy_package_network() {
-    local package="$1" target="$2" safe_id safe_name timestamp root bundle sidecar volume_name capacity_mb mount image_root destination workdir copy_bytes
+    local package="$1" target="$2" safe_id safe_name timestamp root bundle sidecar volume_name capacity_mb mount image_root destination workdir copy_bytes free required
     safe_id=$(printf '%s' "$MIGRATION_PACKAGE_ID" | /usr/bin/tr -cd '[:alnum:]._-' ); safe_name=$(printf '%s' "$MIGRATION_PACKAGE_NAME" | /usr/bin/tr '/:' '__')
     timestamp=$(/bin/date +%Y%m%d-%H%M%S); root="$target/$MANAGED_DIR_NAME/$APP_BACKUP_DIR_NAME/$safe_id"
     bundle="$root/$timestamp-$$-$safe_name.appmigration.sparsebundle"; sidecar="$bundle.appoffload.conf"; volume_name="AppMigration-$safe_id-$$"
-    copy_bytes=$(path_bytes "$package"); capacity_mb=$(((copy_bytes + copy_bytes / 4 + 536870912 + 1048575) / 1048576)); [ "$capacity_mb" -lt 1024 ] && capacity_mb=1024
+    copy_bytes=$(path_bytes "$package") || { APPOFFLOAD_ERROR="Could not measure the backup being moved."; return 1; }
+    free=$(available_bytes "$target"); required=$((copy_bytes + copy_bytes / 20 + 67108864))
+    [ -n "$free" ] && [ "$free" -ge "$required" ] || { APPOFFLOAD_ERROR="Not enough network space for the backup move: need $(human_bytes "$required"), have $(human_bytes "${free:-0}")."; return 1; }
+    capacity_mb=$(((copy_bytes + copy_bytes / 4 + 536870912 + 1048575) / 1048576)); [ "$capacity_mb" -lt 1024 ] && capacity_mb=1024
     /bin/mkdir -p "$root" || { APPOFFLOAD_ERROR="Could not create network backup folder."; return 1; }
     if ! "$HDIUTIL_BIN" create -type SPARSEBUNDLE -fs APFS -size "${capacity_mb}m" -volname "$volume_name" "$bundle" >/dev/null 2>&1; then APPOFFLOAD_ERROR="Could not create the destination sparsebundle."; return 1; fi
     ACTIVE_MIGRATION_NETWORK_BUNDLE="$bundle"
@@ -521,7 +532,12 @@ migration_copy_package_network() {
     copy_with_progress "$package" "$destination" "$copy_bytes" || { rollback_active_transaction; return 1; }
     migration_verify_pair "$package" "$destination" "$workdir" "network-backup-move" || { rollback_active_transaction; return 1; }
     /bin/rm -rf "$workdir"
-    if ! migration_detach_sparsebundle "$mount"; then return 1; fi
+    if ! migration_detach_sparsebundle "$mount"; then
+        APPOFFLOAD_ERROR="Could not unmount the completed sparsebundle; it was retained at $bundle."
+        ACTIVE_MIGRATION_MOUNT=""; ACTIVE_MIGRATION_NETWORK_BUNDLE=""
+        clear_active_transaction
+        return 1
+    fi
     ACTIVE_MIGRATION_MOUNT=""
     {
         printf 'format=1\ntransport=sparsebundle\ncreated_at=%s\n' "$MIGRATION_PACKAGE_CREATED"
@@ -655,12 +671,12 @@ rollback_migration_commits() {
 }
 
 rollback_migration_mount() {
-    local bundle="$ACTIVE_MIGRATION_NETWORK_BUNDLE"
+    local bundle="$ACTIVE_MIGRATION_NETWORK_BUNDLE" detached=1
     if [ -n "$ACTIVE_MIGRATION_MOUNT" ]; then
-        "$HDIUTIL_BIN" detach "$ACTIVE_MIGRATION_MOUNT" >/dev/null 2>&1 || true
+        "$HDIUTIL_BIN" detach "$ACTIVE_MIGRATION_MOUNT" >/dev/null 2>&1 || detached=0
     fi
     ACTIVE_MIGRATION_MOUNT=""
-    if [ -n "$bundle" ] && migration_network_bundle_safe "$bundle" && [ ! -f "$bundle.appoffload.conf" ]; then
+    if [ "$detached" -eq 1 ] && [ -n "$bundle" ] && migration_network_bundle_safe "$bundle" && [ ! -f "$bundle.appoffload.conf" ]; then
         /bin/rm -rf "$bundle"
     fi
     ACTIVE_MIGRATION_NETWORK_BUNDLE=""

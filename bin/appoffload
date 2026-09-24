@@ -168,7 +168,7 @@ case "$command_name" in
             forget)
                 [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
                 source=$(resolve_source "$3")
-                if remove_offload_record "$source"; then echo "Removed health record: $source"; else echo "Error: could not update registry" >&2; exit 1; fi
+                if remove_offload_record "$source"; then echo "Removed health record: $source"; else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi
                 ;;
             clean-staging)
                 [ "$#" -eq 4 ] && [ "$4" = "--yes" ] || { usage >&2; exit 2; }
@@ -190,13 +190,15 @@ case "$command_name" in
         case "$app_action" in
             inspect)
                 [ "$#" -eq 3 ] || { usage >&2; exit 2; }
-                app_path=$(resolve_migratable_app "$3") || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                resolve_migratable_app "$3" >/dev/null || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                app_path=$RESOLVED_MIGRATABLE_APP
                 printf '%-10s %12s  %-16s %s\n' "CATEGORY" "SIZE" "SOURCE" "PATH"
                 while IFS=$'\t' read -r size category relative source; do printf '%-10s %12s  %-16s %s\n' "$category" "$(human_bytes "$size")" "$(migration_source_kind "$source")" "$source"; done < <(app_migration_inventory "$app_path")
                 ;;
             backup)
                 [ "$#" -eq 5 ] && [ "$4" = "--target" ] || { usage >&2; exit 2; }
-                app_path=$(resolve_migratable_app "$3") || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                resolve_migratable_app "$3" >/dev/null || { echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; }
+                app_path=$RESOLVED_MIGRATABLE_APP
                 if create_app_migration_backup "$app_path" "$5"; then
                     printf '\nMigration backup complete: %s\nItems: %s (%s existing offload(s) materialized)\nData copied: %s\nBackup: %s\nLocal disk usage unchanged.\n' "$LAST_MIGRATION_APP_NAME" "$LAST_MIGRATION_ITEM_COUNT" "$LAST_MIGRATION_OFFLOADED_COUNT" "$(human_bytes "$LAST_EXTERNAL_BYTES")" "$LAST_MIGRATION_BACKUP"
                 else echo "Error: $APPOFFLOAD_ERROR" >&2; exit 1; fi

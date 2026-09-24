@@ -144,10 +144,16 @@ read_key() {
     local key rest
     IFS= read -rsn1 key
     if [ "$key" = $'\033' ]; then
-        # Arrow keys arrive as ESC plus a two-byte suffix. macOS Bash 3.2 does
-        # not accept fractional read timeouts, so read the complete sequence.
-        IFS= read -rsn2 rest || true
-        key="$key$rest"
+        # A single Esc must return as a key, while arrow-key bytes arrive next.
+        # Bash 3.2 supports whole-second timeouts only.
+        if IFS= read -rsn1 -t 1 rest; then
+            key="$key$rest"
+            if [ "$rest" = "[" ] || [ "$rest" = "O" ]; then
+                rest=""
+                IFS= read -rsn1 -t 1 rest || true
+                key="$key$rest"
+            fi
+        fi
     fi
     printf '%s' "$key"
 }
@@ -573,7 +579,7 @@ tui_health_center() {
                 ;;
             forget-record)
                 confirm_action "Remove stale health record" "$detail" "The local folder and external data will not be changed." || continue
-                if remove_offload_record "$source"; then show_result 1 "Stale registry record removed."; else show_result 0 "Could not update the health registry."; fi
+                if remove_offload_record "$source"; then show_result 1 "Stale registry record removed."; else show_result 0 "$APPOFFLOAD_ERROR"; fi
                 ;;
             clean-staging)
                 confirm_action "Remove stale staging data" "$detail" "Delete this incomplete copy: $source" || continue
